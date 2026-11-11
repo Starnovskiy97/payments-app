@@ -1,31 +1,18 @@
-import { randomUUID } from 'node:crypto';
 import {
   BadGatewayException,
   BadRequestException,
   ConflictException,
   Injectable,
   Logger,
-  NotFoundException,
 } from '@nestjs/common';
 import axios from 'axios';
 import { CreateOrderDto, PaymentResultDto, PayOrderDto } from './dto';
+import { OrdersRepository, type Order } from './orders.repository';
 
 export const PRODUCTS = [
   { id: 'backend-course', name: 'Учебный курс по бэкенду', price: 50000 },
   { id: 'microservices-book', name: 'Книга о микросервисах', price: 120000 },
 ];
-
-interface Order {
-  id: string;
-  productId: string;
-  productName: string;
-  quantity: number;
-  amount: number;
-  currency: 'RUB';
-  status: 'pending' | 'paid';
-  paymentIds: string[];
-  createdAt: string;
-}
 
 interface Payment {
   id: string;
@@ -41,7 +28,6 @@ interface Payment {
 @Injectable()
 export class OrdersService {
   private readonly logger = new Logger(OrdersService.name);
-  private readonly orders = new Map<string, Order>();
   // Promise сохраняется до await: параллельные повторы одного запроса не создают второй платёж.
   private readonly attempts = new Map<string, { method: string; promise: Promise<Payment> }>();
   private readonly activeRequests = new Set<string>();
@@ -51,31 +37,25 @@ export class OrdersService {
     headers: { 'x-internal-token': process.env.INTERNAL_API_TOKEN ?? 'local-learning-only' },
   });
 
+  constructor(private readonly orders: OrdersRepository) {}
+
   list() {
-    return [...this.orders.values()].reverse();
+    return this.orders.list();
   }
 
   get(id: string) {
-    const order = this.orders.get(id);
-    if (!order) throw new NotFoundException('Заказ не найден');
-    return order;
+    return this.orders.get(id);
   }
 
-  create(dto: CreateOrderDto) {
+  async create(dto: CreateOrderDto) {
     const product = PRODUCTS.find((item) => item.id === dto.productId);
     if (!product) throw new BadRequestException('Неизвестный товар');
-    const order: Order = {
-      id: randomUUID(),
+    const order = await this.orders.create({
       productId: product.id,
       productName: product.name,
       quantity: dto.quantity,
-      amount: product.price * dto.quantity,
-      currency: 'RUB',
-      status: 'pending',
-      paymentIds: [],
-      createdAt: new Date().toISOString(),
-    };
-    this.orders.set(order.id, order);
+      unitPrice: product.price,
+    });
     this.logger.log(`Создан заказ ${order.id}, сумма ${order.amount} коп.`);
     return order;
   }
@@ -84,7 +64,7 @@ export class OrdersService {
     if (!key || !/^[\w-]{8,128}$/.test(key)) {
       throw new BadRequestException('Нужен заголовок Idempotency-Key: 8–128 букв, цифр, _ или -');
     }
-    const order = this.get(id);
+    const order = await this.get(id);
     const attemptKey = `${id}:${key}`;
     const existing = this.attempts.get(attemptKey);
     if (existing) {
@@ -126,7 +106,7 @@ export class OrdersService {
         method: dto.method,
         idempotencyKey: key,
       });
-      if (!order.paymentIds.includes(data.id)) order.paymentIds.push(data.id);
+      await this.orders.linkPayment(order.id, data.id);
       this.logger.log(`Заказ ${order.id} → платёж ${data.id}`);
       return data;
     } catch (error) {
@@ -147,7 +127,7 @@ export class OrdersService {
   }
 
   async handlePaymentResult(dto: PaymentResultDto) {
-    const order = this.get(dto.orderId);
+    const order = await this.get(dto.orderId);
     if (!order.paymentIds.includes(dto.paymentId))
       throw new ConflictException('Платёж не принадлежит заказу');
     // Не доверяем одному лишь телу уведомления: сверяем состояние в payments-service.
@@ -160,11 +140,12 @@ export class OrdersService {
     ) {
       throw new ConflictException('Данные платежа не совпадают с заказом или уведомлением');
     }
-    if (payment.status === 'succeeded') order.status = 'paid';
+    if (payment.status === 'succeeded') await this.orders.markPaid(order.id);
+    const updated = await this.get(order.id);
     // Повторное уведомление безопасно. Неуспешная попытка не отменяет уже оплаченную покупку.
     this.logger.log(
-      `Результат ${dto.status}: платёж ${dto.paymentId}, заказ ${order.id} (${order.status})`,
+      `Результат ${dto.status}: платёж ${dto.paymentId}, заказ ${order.id} (${updated.status})`,
     );
-    return order;
+    return updated;
   }
 }

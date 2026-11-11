@@ -1,0 +1,39 @@
+name: payments-lab
+
+services:
+  orders-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: local_admin_only
+      POSTGRES_DB: postgres
+    ports:
+      - '127.0.0.1:15432:5432'
+    volumes:
+      - orders-data:/var/lib/postgresql/data
+      - ./infra/postgres/init-orders.sql:/docker-entrypoint-initdb.d/01-orders.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d postgres']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  orders-test-db:
+    image: postgres:17-alpine
+    profiles: ['test']
+    environment:
+      POSTGRES_USER: orders_test
+      POSTGRES_PASSWORD: orders_test_local
+      POSTGRES_DB: orders_test
+    ports:
+      - '127.0.0.1:15433:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U orders_test -d orders_test']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  orders-data:

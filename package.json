@@ -6,16 +6,22 @@
     "apps/*"
   ],
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.14.0"
   },
   "scripts": {
     "dev": "concurrently -k -n orders,payments,client -c blue,magenta,green \"npm run dev -w @lab/orders-service\" \"npm run dev -w @lab/payments-service\" \"npm run dev -w @lab/client\"",
     "build": "npm run build --workspaces",
     "typecheck": "npm run typecheck --workspaces",
-    "test": "npm run build && npm run test:integration",
+    "test": "npm run build && npm run db:test:up && npm run test:integration",
     "test:integration": "node --test tests/integration.test.mjs",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "db:up": "docker compose up -d --wait orders-db",
+    "db:down": "docker compose stop orders-db",
+    "db:migrate": "npm run migration:run -w @lab/orders-service",
+    "db:migrations": "npm run migration:show -w @lab/orders-service",
+    "db:test:up": "docker compose --profile test up -d --wait orders-test-db",
+    "db:test:down": "docker compose --profile test stop orders-test-db"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
