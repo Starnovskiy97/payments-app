@@ -453,8 +453,9 @@ export default function App() {
                 )}
                 <p className="text-xs leading-relaxed text-muted-foreground">
                   При сетевой ошибке повтор используется с тем же Idempotency-Key. После отказа
-                  можно создать новую попытку. Заказы сохраняются в PostgreSQL. Платежи и ключи
-                  идемпотентности пока остаются в памяти и могут теряться при перезапуске.
+                  можно создать новую попытку. Заказы, платежи и ключи сохраняются в отдельных
+                  PostgreSQL и переживают перезапуск сервисов. Автоматической доставки уведомлений
+                  пока нет.
                 </p>
               </>
             )}
@@ -516,7 +517,7 @@ export default function App() {
         </CardContent>
       </Card>
       <footer className="py-6 text-center text-xs text-muted-foreground">
-        NestJS + HTTP · Заказы: PostgreSQL · Платежи: in-memory mock
+        NestJS + HTTP · Две PostgreSQL · Долговечные платежи · Mock provider
       </footer>
     </main>
   );

@@ -28,9 +28,6 @@ interface Payment {
 @Injectable()
 export class OrdersService {
   private readonly logger = new Logger(OrdersService.name);
-  // Promise сохраняется до await: параллельные повторы одного запроса не создают второй платёж.
-  private readonly attempts = new Map<string, { method: string; promise: Promise<Payment> }>();
-  private readonly activeRequests = new Set<string>();
   private readonly payments = axios.create({
     baseURL: process.env.PAYMENTS_SERVICE_URL ?? 'http://127.0.0.1:3002',
     timeout: 3000,
@@ -65,52 +62,34 @@ export class OrdersService {
       throw new BadRequestException('Нужен заголовок Idempotency-Key: 8–128 букв, цифр, _ или -');
     }
     const order = await this.get(id);
-    const attemptKey = `${id}:${key}`;
-    const existing = this.attempts.get(attemptKey);
-    if (existing) {
-      if (existing.method !== dto.method)
-        throw new ConflictException('Этот ключ уже использован с другим способом оплаты');
-      // При повторе возвращаем актуальный платёж, а не старый pending-снимок.
-      const payment = await existing.promise;
-      return this.fetchPayment(payment.id);
-    }
-    if (order.status === 'paid') throw new ConflictException('Заказ уже оплачен');
-    if (this.activeRequests.has(id))
-      throw new ConflictException('Создание платежа уже выполняется');
-    this.activeRequests.add(id);
-    const promise = this.createPayment(order, dto, key);
-    this.attempts.set(attemptKey, { method: dto.method, promise });
-    try {
-      return await promise;
-    } catch (error) {
-      // После таймаута разрешаем повторить тот же ключ. Payments-service дедуплицирует запрос.
-      this.attempts.delete(attemptKey);
-      throw error;
-    } finally {
-      this.activeRequests.delete(id);
-    }
+    // Для оплаченного заказа разрешён только поиск существующей попытки.
+    // Не создаём новый платёж даже при утрате старых данных сервиса платежей.
+    return this.createPayment(order, dto, key);
   }
 
   private async createPayment(order: Order, dto: PayOrderDto, key: string) {
     try {
-      if (order.paymentIds.length > 0) {
-        const last = await this.payments.get<Payment>(`/payments/${order.paymentIds.at(-1)}`);
-        if (last.data.status !== 'failed') {
-          throw new ConflictException('У заказа уже есть незавершённый или успешный платёж');
-        }
-      }
-      const { data } = await this.payments.post<Payment>('/payments', {
+      const path = order.status === 'paid' ? '/payments/lookup' : '/payments';
+      const { data } = await this.payments.post<Payment>(path, {
         orderId: order.id,
         amount: order.amount,
         currency: order.currency,
         method: dto.method,
         idempotencyKey: key,
       });
-      await this.orders.linkPayment(order.id, data.id);
+      // Повтор исходного запроса восстанавливает локальную связь и статус,
+      // если предыдущий ответ или уведомление потерялись между сервисами.
+      await this.orders.recordPayment(order.id, data.id, data.status === 'succeeded');
       this.logger.log(`Заказ ${order.id} → платёж ${data.id}`);
       return data;
     } catch (error) {
-      if (error instanceof ConflictException) throw error;
+      if (order.status === 'paid' && axios.isAxiosError(error) && error.response?.status === 404) {
+        throw new ConflictException('Заказ уже оплачен. Новый платёж создать нельзя');
+      }
+      if (axios.isAxiosError<{ message?: unknown }>(error) && error.response?.status === 409) {
+        const message = error.response.data.message;
+        throw new ConflictException(typeof message === 'string' ? message : 'Конфликт платежа');
+      }
       this.logger.warn(`Не удалось создать платёж для заказа ${order.id}`);
       throw new BadGatewayException(
         'Payments-service недоступен или отклонил запрос. Повторите с тем же Idempotency-Key',

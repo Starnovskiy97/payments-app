@@ -35,5 +35,40 @@ services:
       timeout: 3s
       retries: 30
 
+  payments-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: local_payments_admin_only
+      POSTGRES_DB: postgres
+    ports:
+      - '127.0.0.1:15434:5432'
+    volumes:
+      - payments-data:/var/lib/postgresql/data
+      - ./infra/postgres/init-payments.sql:/docker-entrypoint-initdb.d/01-payments.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d postgres']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  payments-test-db:
+    image: postgres:17-alpine
+    profiles: ['test']
+    environment:
+      POSTGRES_USER: payments_test
+      POSTGRES_PASSWORD: payments_test_local
+      POSTGRES_DB: payments_test
+    ports:
+      - '127.0.0.1:15435:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U payments_test -d payments_test']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
 volumes:
   orders-data:
+  payments-data:

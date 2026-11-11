@@ -1,4 +1,13 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiSecurity, ApiTags } from '@nestjs/swagger';
 import { CreatePaymentDto, MockResultDto } from './dto';
 import { InternalGuard } from './internal.guard';
@@ -19,6 +28,14 @@ export class PaymentsController {
   @ApiSecurity('internal')
   create(@Body() dto: CreatePaymentDto) {
     return this.payments.create(dto);
+  }
+
+  @Post('payments/lookup')
+  @HttpCode(200)
+  @UseGuards(InternalGuard)
+  @ApiSecurity('internal')
+  lookup(@Body() dto: CreatePaymentDto) {
+    return this.payments.lookup(dto);
   }
 
   @Get('payments/:id')

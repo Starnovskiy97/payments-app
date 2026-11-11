@@ -3,12 +3,19 @@ import 'dotenv/config';
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import { DataSource } from 'typeorm';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   if (process.env.NODE_ENV === 'production')
     throw new Error('Учебный симулятор нельзя запускать в production');
   const app = await NestFactory.create(AppModule);
+  if (await app.get(DataSource).showMigrations()) {
+    await app.close();
+    throw new Error(
+      'Есть неприменённые миграции payments-service. Выполните npm run db:migrate из корня.',
+    );
+  }
   app.enableCors({ origin: process.env.CLIENT_ORIGIN ?? 'http://localhost:5173' });
   app.useGlobalPipes(
     new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),

@@ -70,15 +70,20 @@ export class OrdersRepository {
     });
   }
 
-  async linkPayment(id: string, paymentId: string): Promise<void> {
+  async recordPayment(id: string, paymentId: string, paid: boolean): Promise<void> {
     // Атомарный UPDATE, а не чтение массива → изменение в JS → перезапись.
     // Повторное добавление того же ID безопасно и не создаёт дубликат.
     await this.orders
       .createQueryBuilder()
       .update(OrderEntity)
-      .set({ paymentIds: () => 'array_append(payment_ids, CAST(:paymentId AS uuid))' })
+      .set({
+        paymentIds: () => `CASE
+          WHEN CAST(:paymentId AS uuid) = ANY(payment_ids) THEN payment_ids
+          ELSE array_append(payment_ids, CAST(:paymentId AS uuid)) END`,
+        ...(paid ? { status: 'paid' as const } : {}),
+      })
       .where('id = :id', { id })
-      .andWhere('NOT (CAST(:paymentId AS uuid) = ANY(payment_ids))', { paymentId })
+      .setParameter('paymentId', paymentId)
       .execute();
   }
 

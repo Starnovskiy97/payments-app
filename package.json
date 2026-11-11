@@ -16,12 +16,12 @@
     "test:integration": "node --test tests/integration.test.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "db:up": "docker compose up -d --wait orders-db",
-    "db:down": "docker compose stop orders-db",
-    "db:migrate": "npm run migration:run -w @lab/orders-service",
-    "db:migrations": "npm run migration:show -w @lab/orders-service",
-    "db:test:up": "docker compose --profile test up -d --wait orders-test-db",
-    "db:test:down": "docker compose --profile test stop orders-test-db"
+    "db:up": "docker compose up -d --wait orders-db payments-db",
+    "db:down": "docker compose stop orders-db payments-db",
+    "db:migrate": "npm run migration:run -w @lab/orders-service -w @lab/payments-service",
+    "db:migrations": "npm run migration:show -w @lab/orders-service -w @lab/payments-service",
+    "db:test:up": "docker compose --profile test up -d --wait orders-test-db payments-test-db",
+    "db:test:down": "docker compose --profile test stop orders-test-db payments-test-db"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

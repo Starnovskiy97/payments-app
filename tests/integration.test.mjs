@@ -14,15 +14,25 @@ const internal = { 'x-internal-token': token };
 const children = [];
 let output = '';
 let ordersProcess;
+let paymentsProcess;
 let database;
 let adminDatabase;
+let paymentsDatabase;
+let paymentsAdminDatabase;
 let databaseCreated = false;
+let paymentsDatabaseCreated = false;
 const databaseName = `orders_test_${randomUUID().replaceAll('-', '')}`;
 const testDatabaseUrl =
   process.env.TEST_DATABASE_URL ??
   'postgresql://orders_test:orders_test_local@127.0.0.1:15433/orders_test';
 const isolatedDatabaseUrl = new URL(testDatabaseUrl);
 isolatedDatabaseUrl.pathname = `/${databaseName}`;
+const paymentsDatabaseName = `payments_test_${randomUUID().replaceAll('-', '')}`;
+const testPaymentsDatabaseUrl =
+  process.env.TEST_PAYMENTS_DATABASE_URL ??
+  'postgresql://payments_test:payments_test_local@127.0.0.1:15435/payments_test';
+const isolatedPaymentsDatabaseUrl = new URL(testPaymentsDatabaseUrl);
+isolatedPaymentsDatabaseUrl.pathname = `/${paymentsDatabaseName}`;
 
 // Разрешаем зависимости в контексте orders-service, а не полагаемся на hoisting.
 const requireOrders = createRequire(
@@ -30,6 +40,12 @@ const requireOrders = createRequire(
 );
 const { DataSource } = requireOrders('typeorm');
 const { databaseOptions } = requireOrders('./dist/database/database-options.js');
+const requirePayments = createRequire(
+  new URL('../apps/payments-service/package.json', import.meta.url),
+);
+const { databaseOptions: paymentsDatabaseOptions } = requirePayments(
+  './dist/database/database-options.js',
+);
 
 async function api(base, path, body, headers = {}) {
   const response = await fetch(`${base}${path}`, {
@@ -41,7 +57,7 @@ async function api(base, path, body, headers = {}) {
   return { status: response.status, data: await response.json() };
 }
 
-function start(service, port) {
+function start(service, port, overrides = {}) {
   const child = spawn(process.execPath, [`apps/${service}/dist/main.js`], {
     env: {
       ...process.env,
@@ -50,7 +66,11 @@ function start(service, port) {
       ORDERS_SERVICE_URL: ordersUrl,
       PAYMENTS_SERVICE_URL: paymentsUrl,
       INTERNAL_API_TOKEN: token,
-      DATABASE_URL: isolatedDatabaseUrl.toString(),
+      DATABASE_URL:
+        service === 'payments-service'
+          ? isolatedPaymentsDatabaseUrl.toString()
+          : isolatedDatabaseUrl.toString(),
+      ...overrides,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -96,8 +116,23 @@ before(async () => {
   // Откат проверяется только на пустой одноразовой тестовой базе.
   await database.undoLastMigration();
   assert.equal((await database.runMigrations()).length, 1);
+
+  paymentsAdminDatabase = new DataSource({ type: 'postgres', url: testPaymentsDatabaseUrl });
+  await paymentsAdminDatabase.initialize();
+  await paymentsAdminDatabase.query(`CREATE DATABASE "${paymentsDatabaseName}"`);
+  paymentsDatabaseCreated = true;
+  paymentsDatabase = new DataSource({
+    ...paymentsDatabaseOptions(),
+    url: isolatedPaymentsDatabaseUrl.toString(),
+  });
+  await paymentsDatabase.initialize();
+  assert.equal((await paymentsDatabase.runMigrations()).length, 1);
+  assert.equal((await paymentsDatabase.runMigrations()).length, 0);
+  await paymentsDatabase.undoLastMigration();
+  assert.equal((await paymentsDatabase.runMigrations()).length, 1);
+
   ordersProcess = start('orders-service', 3101);
-  start('payments-service', 3102);
+  paymentsProcess = start('payments-service', 3102);
   await Promise.all([ready(ordersUrl), ready(paymentsUrl)]);
 });
 
@@ -107,6 +142,12 @@ after(async () => {
   if (adminDatabase?.isInitialized) {
     if (databaseCreated) await adminDatabase.query(`DROP DATABASE "${databaseName}"`);
     await adminDatabase.destroy();
+  }
+  if (paymentsDatabase?.isInitialized) await paymentsDatabase.destroy();
+  if (paymentsAdminDatabase?.isInitialized) {
+    if (paymentsDatabaseCreated)
+      await paymentsAdminDatabase.query(`DROP DATABASE "${paymentsDatabaseName}"`);
+    await paymentsAdminDatabase.destroy();
   }
 });
 
@@ -213,6 +254,7 @@ test('валидация DTO, UUID, ключей и межсервисного �
   assert.equal((await api(ordersUrl, '/orders/not-a-uuid')).status, 400);
   assert.equal((await api(ordersUrl, `/orders/${randomUUID()}`)).status, 404);
   assert.equal((await api(paymentsUrl, '/payments', {})).status, 401);
+  assert.equal((await api(paymentsUrl, '/payments/lookup', {})).status, 401);
   assert.equal((await api(ordersUrl, '/internal/payment-results', {})).status, 401);
   const order = await createOrder();
   assert.equal((await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'card' })).status, 400);
@@ -351,4 +393,307 @@ test('ошибка позиции откатывает весь заказ, ог
     ),
     /foreign key constraint/,
   );
+});
+
+async function restartServices() {
+  await Promise.all([stop(ordersProcess), stop(paymentsProcess)]);
+  ordersProcess = start('orders-service', 3101);
+  paymentsProcess = start('payments-service', 3102);
+  await Promise.all([ready(ordersUrl), ready(paymentsUrl)]);
+}
+
+test('ключ, платёж и доставка переживают перезапуск обоих сервисов', async () => {
+  const order = await createOrder();
+  const headers = { 'Idempotency-Key': randomUUID() };
+  const initial = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'sbp' }, headers);
+  assert.equal(initial.status, 201);
+  assert.equal('idempotencyKey' in initial.data, false);
+
+  await restartServices();
+  assert.deepEqual((await api(paymentsUrl, `/payments/${initial.data.id}`)).data, initial.data);
+  const repeated = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'sbp' }, headers);
+  assert.equal(repeated.status, 201);
+  assert.equal(repeated.data.id, initial.data.id);
+  assert.equal(
+    (await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'card' }, headers)).status,
+    409,
+  );
+
+  const paid = await api(paymentsUrl, `/payments/${initial.data.id}/mock-result`, {
+    status: 'succeeded',
+  });
+  assert.equal(paid.data.notificationStatus, 'delivered');
+  await restartServices();
+  const replay = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'sbp' }, headers);
+  assert.equal(replay.status, 201);
+  assert.deepEqual(replay.data, paid.data);
+  assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'paid');
+  assert.deepEqual((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds, [
+    initial.data.id,
+  ]);
+  const changed = await api(
+    ordersUrl,
+    `/orders/${order.id}/pay`,
+    { method: 'sbp' },
+    { 'Idempotency-Key': randomUUID() },
+  );
+  assert.equal(changed.status, 409);
+  const rows = await paymentsDatabase.query(
+    'SELECT count(*)::integer AS count FROM payments WHERE order_id = $1',
+    [order.id],
+  );
+  assert.equal(rows[0].count, 1);
+});
+
+test('две реплики сервисов не создают дубли ни с одним, ни с разными ключами', async () => {
+  const replicaUrl = 'http://127.0.0.1:3104';
+  const ordersReplicaUrl = 'http://127.0.0.1:3103';
+  const replica = start('payments-service', 3104);
+  const ordersReplica = start('orders-service', 3103, { PAYMENTS_SERVICE_URL: replicaUrl });
+  try {
+    await Promise.all([ready(replicaUrl), ready(ordersReplicaUrl)]);
+    const order = await createOrder();
+    const headers = { 'Idempotency-Key': randomUUID() };
+    const throughOrders = await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        api(
+          index % 2 ? ordersUrl : ordersReplicaUrl,
+          `/orders/${order.id}/pay`,
+          { method: 'card' },
+          headers,
+        ),
+      ),
+    );
+    throughOrders.forEach((result) => assert.equal(result.status, 201));
+    assert.equal(new Set(throughOrders.map((result) => result.data.id)).size, 1);
+    assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds.length, 1);
+    const dto = {
+      orderId: randomUUID(),
+      amount: 50000,
+      currency: 'RUB',
+      method: 'card',
+      idempotencyKey: randomUUID(),
+    };
+    const sameKey = await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        api(index % 2 ? paymentsUrl : replicaUrl, '/payments', dto, internal),
+      ),
+    );
+    sameKey.forEach((result) => assert.equal(result.status, 201));
+    assert.equal(new Set(sameKey.map((result) => result.data.id)).size, 1);
+
+    const anotherOrder = randomUUID();
+    const differentKeys = await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        api(
+          index % 2 ? paymentsUrl : replicaUrl,
+          '/payments',
+          { ...dto, orderId: anotherOrder, idempotencyKey: randomUUID() },
+          internal,
+        ),
+      ),
+    );
+    assert.equal(differentKeys.filter((result) => result.status === 201).length, 1);
+    assert.equal(differentKeys.filter((result) => result.status === 409).length, 11);
+    const rows = await paymentsDatabase.query(
+      'SELECT count(*)::integer AS count FROM payments WHERE order_id = $1',
+      [anotherOrder],
+    );
+    assert.equal(rows[0].count, 1);
+  } finally {
+    await Promise.all([stop(replica), stop(ordersReplica)]);
+  }
+});
+
+test('неуспешная доставка сохраняется; исходный ключ восстанавливает заказ после рестарта', async () => {
+  const order = await createOrder();
+  const headers = { 'Idempotency-Key': randomUUID() };
+  const initial = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'card' }, headers);
+  await stop(ordersProcess);
+  const result = await api(paymentsUrl, `/payments/${initial.data.id}/mock-result`, {
+    status: 'succeeded',
+  });
+  assert.equal(result.data.status, 'succeeded');
+  assert.equal(result.data.notificationStatus, 'failed');
+  assert.equal(result.data.notificationAttempts, 1);
+
+  await restartServices();
+  assert.deepEqual((await api(paymentsUrl, `/payments/${initial.data.id}`)).data, result.data);
+  assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
+  const replay = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'card' }, headers);
+  assert.equal(replay.status, 201);
+  assert.equal(replay.data.id, initial.data.id);
+  assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'paid');
+
+  const delivered = await api(paymentsUrl, `/payments/${initial.data.id}/mock-result`, {
+    status: 'succeeded',
+  });
+  assert.equal(delivered.data.notificationStatus, 'delivered');
+  assert.equal(delivered.data.notificationAttempts, 2);
+});
+
+test('повтор запроса восстанавливает потерянную связь с платежом без создания нового', async () => {
+  const order = await createOrder();
+  const key = randomUUID();
+  // Воспроизводим окно: payments-service сохранил запись, orders-service ещё не записал ID.
+  const initial = await api(
+    paymentsUrl,
+    '/payments',
+    {
+      orderId: order.id,
+      amount: order.amount,
+      currency: 'RUB',
+      method: 'card',
+      idempotencyKey: key,
+    },
+    internal,
+  );
+  assert.equal(initial.status, 201);
+  assert.deepEqual((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds, []);
+  const earlyResult = await api(paymentsUrl, `/payments/${initial.data.id}/mock-result`, {
+    status: 'succeeded',
+  });
+  assert.equal(earlyResult.data.notificationStatus, 'failed');
+  await restartServices();
+  const replay = await api(
+    ordersUrl,
+    `/orders/${order.id}/pay`,
+    { method: 'card' },
+    { 'Idempotency-Key': key },
+  );
+  assert.equal(replay.status, 201);
+  assert.equal(replay.data.id, initial.data.id);
+  assert.equal(replay.data.status, 'succeeded');
+  assert.deepEqual((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds, [
+    initial.data.id,
+  ]);
+  assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'paid');
+});
+
+test('финальный статус защищён от гонки; повторные уведомления не теряют счётчик', async () => {
+  const order = await createOrder();
+  const initial = await api(
+    ordersUrl,
+    `/orders/${order.id}/pay`,
+    { method: 'card' },
+    { 'Idempotency-Key': randomUUID() },
+  );
+  const outcomes = await Promise.all(
+    ['succeeded', 'failed'].map((status) =>
+      api(paymentsUrl, `/payments/${initial.data.id}/mock-result`, { status }),
+    ),
+  );
+  assert.equal(outcomes.filter((result) => result.status === 201).length, 1);
+  assert.equal(outcomes.filter((result) => result.status === 409).length, 1);
+  const winner = outcomes.find((result) => result.status === 201).data;
+  assert.equal(winner.notificationStatus, 'delivered');
+  await Promise.all(
+    Array.from({ length: 5 }, () =>
+      api(paymentsUrl, `/payments/${initial.data.id}/mock-result`, { status: winner.status }),
+    ),
+  );
+  const saved = (await api(paymentsUrl, `/payments/${initial.data.id}`)).data;
+  assert.equal(saved.status, winner.status);
+  assert.equal(saved.notificationAttempts, 6);
+  assert.equal(saved.notificationStatus, 'delivered');
+
+  // Ошибка позднего повтора не отменяет уже доказанную доставку.
+  await stop(ordersProcess);
+  try {
+    const failedRetry = await api(paymentsUrl, `/payments/${initial.data.id}/mock-result`, {
+      status: winner.status,
+    });
+    assert.equal(failedRetry.data.notificationStatus, 'delivered');
+    assert.equal(failedRetry.data.notificationAttempts, 7);
+  } finally {
+    ordersProcess = start('orders-service', 3101);
+    await ready(ordersUrl);
+  }
+});
+
+test('ключ отклонённой попытки остаётся занят; один ключ можно использовать у разных заказов', async () => {
+  const firstOrder = await createOrder();
+  const secondOrder = await createOrder();
+  const headers = { 'Idempotency-Key': randomUUID() };
+  const first = await api(ordersUrl, `/orders/${firstOrder.id}/pay`, { method: 'card' }, headers);
+  await api(paymentsUrl, `/payments/${first.data.id}/mock-result`, { status: 'failed' });
+  const second = await api(ordersUrl, `/orders/${secondOrder.id}/pay`, { method: 'card' }, headers);
+  assert.equal(second.status, 201);
+  assert.notEqual(second.data.id, first.data.id);
+  const next = await api(
+    ordersUrl,
+    `/orders/${firstOrder.id}/pay`,
+    { method: 'crypto' },
+    { 'Idempotency-Key': randomUUID() },
+  );
+  assert.equal(next.status, 201);
+  await api(paymentsUrl, `/payments/${next.data.id}/mock-result`, { status: 'succeeded' });
+  await restartServices();
+  const replay = await api(ordersUrl, `/orders/${firstOrder.id}/pay`, { method: 'card' }, headers);
+  assert.equal(replay.status, 201);
+  assert.equal(replay.data.id, first.data.id);
+  assert.equal(replay.data.status, 'failed');
+  assert.equal((await api(ordersUrl, `/orders/${firstOrder.id}`)).data.status, 'paid');
+  assert.equal(
+    (await api(ordersUrl, `/orders/${firstOrder.id}/pay`, { method: 'sbp' }, headers)).status,
+    409,
+  );
+});
+
+test('ограничения payments защищают таблицу даже при прямом SQL', async () => {
+  assert.equal(
+    (await database.query("SELECT to_regclass('public.payments') AS table_name"))[0].table_name,
+    null,
+  );
+  assert.equal(
+    (await paymentsDatabase.query("SELECT to_regclass('public.orders') AS table_name"))[0]
+      .table_name,
+    null,
+  );
+  const dto = {
+    orderId: randomUUID(),
+    amount: 50000,
+    currency: 'RUB',
+    method: 'card',
+    idempotencyKey: randomUUID(),
+  };
+  await api(paymentsUrl, '/payments', dto, internal);
+  const insert = `INSERT INTO payments (id, order_id, idempotency_key, amount, currency, method, provider, status)
+    VALUES ($1, $2, $3, $4, 'RUB', 'card', 'mock', $5)`;
+  await assert.rejects(
+    paymentsDatabase.query(insert, [
+      randomUUID(),
+      dto.orderId,
+      dto.idempotencyKey,
+      50000,
+      'failed',
+    ]),
+    (error) => error.driverError.constraint === 'payments_order_key_unique',
+  );
+  await assert.rejects(
+    paymentsDatabase.query(insert, [randomUUID(), dto.orderId, randomUUID(), 50000, 'pending']),
+    (error) => error.driverError.constraint === 'payments_one_active_per_order',
+  );
+  await assert.rejects(
+    paymentsDatabase.query(insert, [randomUUID(), randomUUID(), randomUUID(), -1, 'pending']),
+    (error) => error.driverError.constraint === 'payments_amount_range',
+  );
+});
+
+test('оплаченный заказ без старой записи платежа не допускает нового списания', async () => {
+  const order = await createOrder();
+  // Например, заказ остался с первого этапа, когда платежи ещё жили в Map.
+  await database.query("UPDATE orders SET status = 'paid' WHERE id = $1", [order.id]);
+  const result = await api(
+    ordersUrl,
+    `/orders/${order.id}/pay`,
+    { method: 'card' },
+    { 'Idempotency-Key': randomUUID() },
+  );
+  assert.equal(result.status, 409);
+  const rows = await paymentsDatabase.query(
+    'SELECT count(*)::integer AS count FROM payments WHERE order_id = $1',
+    [order.id],
+  );
+  assert.equal(rows[0].count, 0);
 });
