@@ -60,6 +60,7 @@ function parseBody(body: unknown) {
 
 function makeClient(baseURL: string) {
   const instance = axios.create({ baseURL, timeout: 12000 });
+
   instance.interceptors.response.use(
     (response) => {
       record(
@@ -90,6 +91,7 @@ function makeClient(baseURL: string) {
 
 export const ordersApi = makeClient('/api/orders');
 export const paymentsApi = makeClient('/api/payments');
+export const providerApi = makeClient('/api/provider');
 
 export function errorMessage(error: unknown) {
   if (axios.isAxiosError(error)) {

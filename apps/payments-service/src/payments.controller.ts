@@ -9,7 +9,8 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiSecurity, ApiTags } from '@nestjs/swagger';
-import { CreatePaymentDto, MockResultDto } from './dto';
+import { CreatePaymentDto, ProviderWebhookDto } from './dto';
+import { ProviderSignatureGuard } from './provider-signature.guard';
 import { InternalGuard } from './internal.guard';
 import { PaymentsService } from './payments.service';
 
@@ -20,7 +21,7 @@ export class PaymentsController {
 
   @Get('health')
   health() {
-    return { service: 'payments-service', status: 'ok', provider: 'mock' };
+    return { service: 'payments-service', status: 'ok', provider: 'simulator' };
   }
 
   @Post('payments')
@@ -43,8 +44,16 @@ export class PaymentsController {
     return this.payments.get(id);
   }
 
-  @Post('payments/:id/mock-result')
-  simulate(@Param('id', ParseUUIDPipe) id: string, @Body() dto: MockResultDto) {
-    return this.payments.simulate(id, dto);
+  @Post('payments/:id/sync')
+  @HttpCode(200)
+  sync(@Param('id', ParseUUIDPipe) id: string) {
+    return this.payments.sync(id);
+  }
+
+  @Post('webhooks/simulator')
+  @HttpCode(200)
+  @UseGuards(ProviderSignatureGuard)
+  webhook(@Body() dto: ProviderWebhookDto) {
+    return this.payments.handleWebhook(dto);
   }
 }

@@ -3,7 +3,7 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { PaymentEntity } from './database/entities/payment.entity';
-import { CreatePaymentDto, MockResultDto } from './dto';
+import { CreatePaymentDto, ProviderWebhookDto } from './dto';
 
 // В публичный ответ намеренно не включаем внутренний ключ идемпотентности.
 export interface Payment {
@@ -13,6 +13,8 @@ export interface Payment {
   currency: 'RUB';
   method: CreatePaymentDto['method'];
   provider: string;
+  providerPaymentId: string | null;
+  checkoutUrl: string | null;
   status: 'pending' | 'succeeded' | 'failed';
   notificationStatus: 'not_sent' | 'delivered' | 'failed';
   notificationAttempts: number;
@@ -70,7 +72,25 @@ export class PaymentsRepository {
     return this.matchRequest(payment, dto);
   }
 
-  async recordResult(id: string, status: MockResultDto['status']): Promise<Payment> {
+  async attachProvider(id: string, providerPaymentId: string, checkoutUrl: string): Promise<void> {
+    await this.payments.manager.transaction(async (manager) => {
+      const payment = await manager.findOneByOrFail(PaymentEntity, { id });
+      // Условия UPDATE защищают и от конкурирующих ответов разных запросов.
+      const updated = await manager
+        .createQueryBuilder()
+        .update(PaymentEntity)
+        .set({ providerPaymentId, checkoutUrl })
+        .where('id = :id', { id })
+        .andWhere('(provider_payment_id IS NULL OR provider_payment_id = :providerPaymentId)', {
+          providerPaymentId,
+        })
+        .execute();
+      if (updated.affected !== 1)
+        throw new ConflictException(`Другая внешняя операция уже связана с платежом ${payment.id}`);
+    });
+  }
+
+  async recordResult(id: string, status: ProviderWebhookDto['status']): Promise<Payment> {
     return this.payments.manager.transaction(async (manager) => {
       const payment = await manager.findOne(PaymentEntity, {
         where: { id },
@@ -107,6 +127,8 @@ export class PaymentsRepository {
       currency: entity.currency,
       method: entity.method,
       provider: entity.provider,
+      providerPaymentId: entity.providerPaymentId,
+      checkoutUrl: entity.checkoutUrl,
       status: entity.status,
       notificationStatus: entity.notificationStatus,
       notificationAttempts: entity.notificationAttempts,

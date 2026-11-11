@@ -10,6 +10,10 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
+      '/api/provider': {
+        target: 'http://127.0.0.1:3003',
+        rewrite: (path) => path.replace(/^\/api\/provider/, ''),
+      },
       '/api/orders': {
         target: 'http://127.0.0.1:3001',
         rewrite: (path) => path.replace(/^\/api\/orders/, ''),

@@ -25,7 +25,29 @@ export class CreatePaymentDto {
   idempotencyKey!: string;
 }
 
-export class MockResultDto {
+export class ProviderWebhookDto {
+  @ApiProperty()
+  @IsUUID()
+  eventId!: string;
+
+  @ApiProperty()
+  @IsUUID()
+  providerPaymentId!: string;
+
+  @ApiProperty()
+  @IsUUID()
+  merchantPaymentId!: string;
+
+  @ApiProperty()
+  @IsInt()
+  @Min(1)
+  @Max(100000000)
+  amount!: number;
+
+  @ApiProperty({ enum: ['RUB'] })
+  @IsIn(['RUB'])
+  currency!: 'RUB';
+
   @ApiProperty({ enum: ['succeeded', 'failed'] })
   @IsIn(['succeeded', 'failed'])
   status!: 'succeeded' | 'failed';

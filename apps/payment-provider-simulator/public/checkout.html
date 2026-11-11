@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>Учебный провайдер — оплата</title>
+    <style>
+      body {
+        font: 16px/1.5 system-ui;
+        background: #f1f5f9;
+        color: #172033;
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        max-width: 600px;
+        margin: 32px auto;
+        background: white;
+        padding: 28px;
+        border-radius: 16px;
+      }
+      button,
+      select {
+        font: inherit;
+        padding: 10px;
+        border-radius: 8px;
+        border: 1px solid #cbd5e1;
+        margin: 4px 0;
+      }
+      button {
+        cursor: pointer;
+        background: #0f766e;
+        color: white;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      pre {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font-size: 12px;
+        background: #f8fafc;
+        padding: 12px;
+      }
+      label {
+        display: block;
+        margin: 12px 0;
+      }
+      strong {
+        color: #0f766e;
+      }
+      #message {
+        white-space: pre-wrap;
+      }
+    </style>
+    <script src="/axios.min.js" defer></script>
+    <script src="/checkout.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <p>PAYMENT PROVIDER SIMULATOR</p>
+      <h1>Учебная платёжная страница</h1>
+      <p>
+        Это отдельная система. Банки, блокчейн и настоящие деньги не используются. Карточные данные
+        вводить не нужно.
+      </p>
+      <strong id="amount">Загрузка…</strong>
+      <pre id="details"></pre>
+      <label
+        >Webhook:
+        <select id="delivery">
+          <option value="send">Отправить</option>
+          <option value="skip">Потерять уведомление</option>
+        </select></label
+      >
+      <label
+        >Задержка:
+        <select id="delay">
+          <option value="0">Нет</option>
+          <option value="2000">2 секунды</option>
+        </select></label
+      >
+      <label
+        >Количество копий:
+        <select id="copies">
+          <option>1</option>
+          <option>2</option>
+          <option>3</option>
+        </select></label
+      >
+      <button id="success" disabled>Оплатить успешно</button>
+      <button id="failure" disabled>Отклонить</button>
+      <button id="repeat" disabled>Повторить webhook</button>
+      <p id="message" role="status"></p>
+      <p>Вернись в магазин и нажми «Обновить» или «Сверить с провайдером».</p>
+    </main>
+  </body>
+</html>

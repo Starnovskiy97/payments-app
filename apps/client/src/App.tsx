@@ -1,19 +1,10 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import {
-  ArrowRight,
-  Check,
-  Code2,
-  CreditCard,
-  FlaskConical,
-  RefreshCw,
-  ShoppingBag,
-  X,
-} from 'lucide-react';
+import { ArrowRight, Code2, CreditCard, FlaskConical, RefreshCw, ShoppingBag } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
-import { errorMessage, ordersApi, paymentsApi, requestLog } from '@/lib/api';
+import { errorMessage, ordersApi, paymentsApi, providerApi, requestLog } from '@/lib/api';
 import type { Method, Order, Payment, Product } from './types';
 
 const money = (amount: number) =>
@@ -57,6 +48,7 @@ export default function App() {
   const [payment, setPayment] = useState<Payment | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const attempts = useRef(new Map<string, { key: string; method: Method }>());
   const logs = useSyncExternalStore(requestLog.subscribe, requestLog.getSnapshot);
   const selected = orders.find((order) => order.id === selectedId);
@@ -87,7 +79,7 @@ export default function App() {
     paymentsApi
       .get<Payment>(`/payments/${latestPaymentId}`)
       .then(({ data }) => {
-        if (!cancelled) setPayment(data);
+        if (!cancelled) acceptPayment(data);
       })
       .catch((cause: unknown) => {
         if (!cancelled) setError(errorMessage(cause));
@@ -100,6 +92,7 @@ export default function App() {
   async function run(action: () => Promise<void>) {
     setBusy(true);
     setError('');
+    setNotice('');
     try {
       await action();
     } catch (cause) {
@@ -116,7 +109,7 @@ export default function App() {
     ]);
     setOrders(list.data);
     setSelectedId((id) => id || list.data[0]?.id || '');
-    if (currentPayment) setPayment(currentPayment.data);
+    if (currentPayment) acceptPayment(currentPayment.data);
     if (products.length === 0) {
       const catalog = await ordersApi.get<Product[]>('/products');
       setProducts(catalog.data);
@@ -146,20 +139,31 @@ export default function App() {
         { method: attempt.method },
         { headers: { 'Idempotency-Key': attempt.key } },
       );
-      setPayment(data);
+      acceptPayment(data);
       await refresh(data.id);
     });
   }
 
-  function simulate(status: 'succeeded' | 'failed') {
+  function acceptPayment(data: Payment) {
+    if (data.status === 'failed') attempts.current.delete(data.orderId);
+    setPayment(data);
+  }
+
+  function syncPayment() {
     if (!payment) return;
     void run(async () => {
-      const { data } = await paymentsApi.post<Payment>(`/payments/${payment.id}/mock-result`, {
-        status,
-      });
-      setPayment(data);
-      if (status === 'failed') attempts.current.delete(data.orderId);
+      const { data } = await paymentsApi.post<Payment>(`/payments/${payment.id}/sync`);
+      acceptPayment(data);
       await refresh(data.id);
+    });
+  }
+
+  function delayNextCreate() {
+    void run(async () => {
+      await providerApi.post('/simulation/next-create', { delayMs: 2500 });
+      setNotice(
+        'Следующий запрос к симулятору сохранит платёж, но задержит ответ на 2,5 с. После ошибки повторите тот же ключ.',
+      );
     });
   }
 
@@ -338,7 +342,7 @@ export default function App() {
               <CreditCard className="size-5 text-primary" />
               Оплата и симулятор
             </CardTitle>
-            <CardDescription>Два независимых сервиса, один сквозной сценарий.</CardDescription>
+            <CardDescription>Наш платёж и отдельная система провайдера.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-5">
             {!selected ? (
@@ -401,38 +405,31 @@ export default function App() {
                       <Status value={payment.status} />
                     </div>
                     <p className="break-all font-mono text-xs text-muted-foreground">
-                      {payment.id}
+                      Наш ID: {payment.id}
+                    </p>
+                    <p className="break-all font-mono text-xs text-muted-foreground">
+                      ID провайдера: {payment.providerPaymentId ?? 'ещё не получен'}
                     </p>
                     <div className="rounded-lg border border-dashed p-4">
                       <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                        Учебное подтверждение провайдера
+                        Результат приходит от внешнего симулятора
                       </p>
                       <div className="flex flex-wrap gap-2">
-                        <Button
-                          size="sm"
-                          disabled={busy || payment.status !== 'pending'}
-                          onClick={() => simulate('succeeded')}
-                        >
-                          <Check className="size-4" />
-                          Успешно
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={busy || payment.status !== 'pending'}
-                          onClick={() => simulate('failed')}
-                        >
-                          <X className="size-4" />
-                          Отклонить
-                        </Button>
+                        {payment.checkoutUrl && (
+                          <Button size="sm" asChild>
+                            <a href={payment.checkoutUrl} target="_blank" rel="noreferrer">
+                              Открыть страницу оплаты ↗
+                            </a>
+                          </Button>
+                        )}
                         <Button
                           size="sm"
                           variant="secondary"
-                          disabled={busy || payment.status === 'pending'}
-                          onClick={() => simulate(payment.status as 'succeeded' | 'failed')}
+                          disabled={busy || payment.provider !== 'simulator'}
+                          onClick={syncPayment}
                         >
                           <RefreshCw className="size-4" />
-                          Повторить уведомление
+                          Сверить с провайдером
                         </Button>
                       </div>
                     </div>
@@ -457,6 +454,14 @@ export default function App() {
                   PostgreSQL и переживают перезапуск сервисов. Автоматической доставки уведомлений
                   пока нет.
                 </p>
+                <Button variant="outline" size="sm" disabled={busy} onClick={delayNextCreate}>
+                  Следующее создание: потерять ответ
+                </Button>
+                {notice && (
+                  <p role="status" className="text-sm text-primary">
+                    {notice}
+                  </p>
+                )}
               </>
             )}
           </CardContent>
@@ -517,7 +522,7 @@ export default function App() {
         </CardContent>
       </Card>
       <footer className="py-6 text-center text-xs text-muted-foreground">
-        NestJS + HTTP · Две PostgreSQL · Долговечные платежи · Mock provider
+        NestJS + HTTP · Три PostgreSQL · Подписанные webhooks · Учебный провайдер
       </footer>
     </main>
   );

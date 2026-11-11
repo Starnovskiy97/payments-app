@@ -22,7 +22,9 @@ export interface Payment {
   currency: 'RUB';
   method: Method;
   status: 'pending' | 'succeeded' | 'failed';
-  provider: 'mock';
+  provider: string;
+  providerPaymentId: string | null;
+  checkoutUrl: string | null;
   notificationStatus: 'not_sent' | 'delivered' | 'failed';
   notificationAttempts: number;
   createdAt: string;

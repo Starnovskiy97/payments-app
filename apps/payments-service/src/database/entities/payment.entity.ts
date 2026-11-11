@@ -24,6 +24,12 @@ export class PaymentEntity {
   @Column({ type: 'varchar', length: 32 })
   provider!: string;
 
+  @Column({ name: 'provider_payment_id', type: 'varchar', length: 128, nullable: true })
+  providerPaymentId!: string | null;
+
+  @Column({ name: 'checkout_url', type: 'varchar', length: 2048, nullable: true })
+  checkoutUrl!: string | null;
+
   @Column({ type: 'varchar', length: 16, default: 'pending' })
   status!: 'pending' | 'succeeded' | 'failed';
 

@@ -69,6 +69,41 @@ services:
       timeout: 3s
       retries: 30
 
+  provider-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: local_provider_admin_only
+      POSTGRES_DB: postgres
+    ports:
+      - '127.0.0.1:15436:5432'
+    volumes:
+      - provider-data:/var/lib/postgresql/data
+      - ./infra/postgres/init-provider.sql:/docker-entrypoint-initdb.d/01-provider.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d postgres']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  provider-test-db:
+    image: postgres:17-alpine
+    profiles: ['test']
+    environment:
+      POSTGRES_USER: provider_test
+      POSTGRES_PASSWORD: provider_test_local
+      POSTGRES_DB: provider_test
+    ports:
+      - '127.0.0.1:15437:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U provider_test -d provider_test']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
 volumes:
   orders-data:
   payments-data:
+  provider-data:
