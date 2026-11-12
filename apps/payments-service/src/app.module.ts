@@ -9,6 +9,7 @@ import { ProviderSignatureGuard } from './provider-signature.guard';
 import { PaymentsController } from './payments.controller';
 import { PaymentsService } from './payments.service';
 import { PaymentsRepository } from './payments.repository';
+import { PaymentEventsPublisher } from './payment-events.publisher';
 
 @Module({
   imports: [
@@ -19,6 +20,7 @@ import { PaymentsRepository } from './payments.repository';
   providers: [
     PaymentsService,
     PaymentsRepository,
+    PaymentEventsPublisher,
     InternalGuard,
     ProviderSignatureGuard,
     { provide: PAYMENT_PROVIDER, useClass: SimulatorPaymentProvider },

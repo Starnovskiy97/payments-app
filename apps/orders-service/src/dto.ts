@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsIn, IsInt, IsString, IsUUID, Max, Min } from 'class-validator';
+import { IsIn, IsInt, IsString, Max, Min } from 'class-validator';
 
 export class CreateOrderDto {
   @ApiProperty({ example: 'backend-course' })
@@ -17,18 +17,4 @@ export class PayOrderDto {
   @ApiProperty({ enum: ['card', 'sbp', 'crypto'] })
   @IsIn(['card', 'sbp', 'crypto'])
   method!: 'card' | 'sbp' | 'crypto';
-}
-
-export class PaymentResultDto {
-  @ApiProperty()
-  @IsUUID()
-  orderId!: string;
-
-  @ApiProperty()
-  @IsUUID()
-  paymentId!: string;
-
-  @ApiProperty({ enum: ['succeeded', 'failed'] })
-  @IsIn(['succeeded', 'failed'])
-  status!: 'succeeded' | 'failed';
 }

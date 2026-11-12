@@ -34,7 +34,13 @@ export class PaymentEntity {
   status!: 'pending' | 'succeeded' | 'failed';
 
   @Column({ name: 'notification_status', type: 'varchar', length: 16, default: 'not_sent' })
-  notificationStatus!: 'not_sent' | 'delivered' | 'failed';
+  notificationStatus!: 'not_sent' | 'published' | 'delivered' | 'failed';
+
+  @Column({ name: 'result_event_id', type: 'uuid', nullable: true })
+  resultEventId!: string | null;
+
+  @Column({ name: 'result_recorded_at', type: 'timestamptz', nullable: true })
+  resultRecordedAt!: Date | null;
 
   @Column({ name: 'notification_attempts', type: 'integer', default: 0 })
   notificationAttempts!: number;

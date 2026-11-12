@@ -9,16 +9,18 @@
 ```bash
 npm install
 npm run db:up
+npm run mq:up
 npm run db:migrate
 npm run dev
 ```
 
-| Приложение          | Адрес                      |
-| ------------------- | -------------------------- |
-| Клиент              | http://localhost:5173      |
-| Заказы / Swagger    | http://127.0.0.1:3001/docs |
-| Платежи / Swagger   | http://127.0.0.1:3002/docs |
-| Провайдер / Swagger | http://127.0.0.1:3003/docs |
+| Приложение          | Адрес                                    |
+| ------------------- | ---------------------------------------- |
+| Клиент              | http://localhost:5173                    |
+| Заказы / Swagger    | http://127.0.0.1:3001/docs               |
+| Платежи / Swagger   | http://127.0.0.1:3002/docs               |
+| Провайдер / Swagger | http://127.0.0.1:3003/docs               |
+| RabbitMQ Management | http://127.0.0.1:15672 (lab / lab_local) |
 
 Копировать `.env` для первого запуска не требуется. При необходимости используй `.env.example` в папке каждого приложения. `Ctrl+C` останавливает приложения; `npm run db:down` — базы, без удаления volumes.
 
@@ -27,7 +29,7 @@ npm run dev
 1. Создай заказ и выбери карту, СБП или криптовалюту — пока это варианты одного учебного сценария, суммы в RUB.
 2. Создай платёж. Появятся наш ID, ID провайдера и ссылка на его страницу.
 3. Открой страницу оплаты и выбери успех или отказ.
-4. Вернись в магазин и нажми «Обновить».
+4. Вернись в магазин и нажми «Обновить». Обработка асинхронная: published ещё не означает paid, при необходимости обнови данные повторно.
 5. На странице провайдера повтори webhook: новой оплаты не появится.
 6. Попробуй потерять webhook и восстановить результат кнопкой «Сверить с провайдером».
 
@@ -38,12 +40,12 @@ npm run dev
 ```text
 React → orders-service → payments-service → payment-provider-simulator
              ▲                 ▲                         │
-             └── notification ─┤                         │
+             └── RabbitMQ ─────┤                         │
                                └──── signed webhook ─────┘
 ```
 
 - Orders-service определяет стоимость по серверному каталогу и хранит заказы с позициями.
-- Payments-service хранит наши попытки и ключи, вызывает провайдера через адаптер PaymentProvider, проверяет webhooks и уведомляет заказы.
+- Payments-service хранит наши попытки и ключи, вызывает провайдера через адаптер PaymentProvider, проверяет webhooks и публикует результат в RabbitMQ. Orders-service обрабатывает сообщение и делает ack только после COMMIT своей базы.
 - Симулятор хранит собственные операции, предоставляет страницу оплаты и отправляет результат. В реальном подключении его роль выполняет платёжная компания.
 - Сервисы не читают чужие таблицы. Общий репозиторий и npm workspaces не объединяют их в один процесс.
 - В React используется Axios, shadcn/ui, Tailwind и локальное состояние. MobX пока не требуется.
@@ -61,12 +63,13 @@ React → orders-service → payments-service → payment-provider-simulator
 1. [PostgreSQL, Entity, DTO и транзакции заказов](docs/backend/01-postgresql-orders.md).
 2. [Платежи, долговечная идемпотентность и конкурентные запросы](docs/backend/02-postgresql-payments.md).
 3. [Внешний провайдер, платёжная страница и webhooks](docs/backend/03-provider-simulator.md).
+4. [RabbitMQ: логика доставки, подтверждений, повторов и DLQ](docs/backend/04-rabbitmq-delivery.md).
 
 Controller принимает HTTP и валидирует DTO. Service содержит бизнес-логику и внешние вызовы. Repository отвечает за БД. Миграции задают изменения схемы; `synchronize` и автоматический запуск миграций отключены. Nest передаёт зависимости через конструкторы и регистрацию providers в модулях.
 
 ## API
 
-Заказы: `GET /products`, `GET /orders`, `POST /orders`, `GET /orders/:id`, `POST /orders/:id/pay`. Создание заказа принимает productId и quantity, но не цену. Оплата требует заголовок Idempotency-Key. Внутренний `POST /internal/payment-results` защищён токеном.
+Заказы: `GET /products`, `GET /orders`, `POST /orders`, `GET /orders/:id`, `POST /orders/:id/pay`. Создание заказа принимает productId и quantity, но не цену. Оплата требует заголовок Idempotency-Key. Старый `POST /internal/payment-results` удалён: результат приходит из очереди.
 
 Платежи: `POST /payments` и `POST /payments/lookup` — внутренние операции с токеном; `GET /payments/:id` читает нашу базу; `POST /payments/:id/sync` сверяет с провайдером; `POST /webhooks/simulator` принимает HMAC-подписанный результат. Прямой `/mock-result` удалён.
 
@@ -78,7 +81,9 @@ Controller принимает HTTP и валидирует DTO. Service соде
 
 - PORT, DATABASE_URL — собственный порт и база каждого бэкенда.
 - INTERNAL_API_TOKEN — общий токен заказов и платежей.
-- ORDERS_SERVICE_URL / PAYMENTS_SERVICE_URL — межсервисные адреса.
+- PAYMENTS_SERVICE_URL — адрес платежей для синхронных операций orders-service. Обратного HTTP-вызова при обработке события больше нет.
+- RABBITMQ_URL — подключение AMQP для заказов и платежей; по умолчанию amqp://lab:lab_local@127.0.0.1:5672?heartbeat=5.
+- RABBITMQ_QUEUE_PREFIX — одинаковый префикс очередей обоих сервисов, по умолчанию payments-lab.
 - PROVIDER_API_URL — серверный адрес провайдера для платежей, по умолчанию http://127.0.0.1:3003.
 - PROVIDER_PUBLIC_URL — браузерный адрес провайдера, http://localhost:3003; одинаковый в платежах и симуляторе.
 - PROVIDER_API_TOKEN — одинаковый токен API в платежах и симуляторе.
@@ -100,15 +105,18 @@ npm run db:up         # три dev-базы
 npm run db:down       # остановить базы, сохранив данные
 npm run db:migrate    # миграции всех бэкендов
 npm run db:migrations # статус миграций
+npm run mq:up         # RabbitMQ с постоянным volume
+npm run mq:down       # остановить брокер без удаления очередей
 npm test              # сборка, тестовые БД и интеграционные тесты
 npm run db:test:down  # остановить тестовые БД
+npm run mq:test:down  # остановить отдельный тестовый брокер
 ```
 
-Отдельное приложение запускается через `npm run dev -w @lab/orders-service`, аналогично payments-service, payment-provider-simulator и client. Nest CLI не требуется: используется TypeScript и tsc-watch. Единый стиль задают `.prettierrc.json` и `.editorconfig`.
+Отдельное приложение запускается через `npm run dev -w @lab/orders-service`, аналогично payments-service, payment-provider-simulator и client. Общий workspace `packages/messaging` содержит контракт события и AMQP-транспорт. Его автоматически собирают predev/prebuild бизнес-сервисов. При изменении самого пакета выполни `npm run build -w @lab/messaging` и перезапусти сервисы; отдельного watch для пакета пока нет. Nest CLI не требуется. Единый стиль задают `.prettierrc.json` и `.editorconfig`.
 
-Тесты используют отдельные PostgreSQL на 15433/15435/15437 и новые временные базы на каждый прогон. Dev-данные не очищаются. Сервисы в тестах слушают 3101/3102/3105, реплики — 3103/3104. Проверяются миграции, транзакции, перезапуски, гонки, подписи, потери и задержки. SIGSTOP/SIGCONT требуют macOS/Linux. Тестовые контейнеры остаются запущенными до db:test:down.
+Тесты используют отдельные PostgreSQL на 15433/15435/15437 и новые временные базы на каждый прогон. Dev-данные не очищаются. Сервисы в тестах слушают 3101/3102/3105, реплики — 3103/3104. Проверяются миграции, транзакции, перезапуски, гонки, подписи, потери и задержки. SIGSTOP/SIGCONT требуют macOS/Linux. Тестовые PostgreSQL останавливаются через db:test:down, тестовый RabbitMQ — через mq:test:down.
 
-Для отдельного `npm run test:integration` сначала выполни build и db:test:up. Адреса тестовых серверов можно задать через TEST_DATABASE_URL, TEST_PAYMENTS_DATABASE_URL и TEST_PROVIDER_DATABASE_URL; роли должны иметь права создания временных баз.
+Для отдельного `npm run test:integration` сначала выполни build, db:test:up и mq:test:up. Тестовый RabbitMQ работает на 5673/15673 (lab_test / lab_test_local); каждый прогон использует свой случайный префикс и удаляет только свои очереди. Dev-брокер не используется. Fault-тесты перезапускают только rabbitmq-test, поэтому один прогон следует запускать отдельно от других на этом брокере. При TEST_RABBITMQ_URL тесты остановки Docker-брокера пропускаются, если явно не указан TEST_RABBITMQ_CONTAINER. Этот параметр разрешает тестам остановить/запустить названный контейнер: указывай только отдельный тестовый брокер. Адреса PostgreSQL можно задать через TEST_DATABASE_URL, TEST_PAYMENTS_DATABASE_URL и TEST_PROVIDER_DATABASE_URL.
 
 ## Границы учебного стенда
 
@@ -116,8 +124,9 @@ npm run db:test:down  # остановить тестовые БД
 - Заказы, платежи и внешние операции долговечны. Ключ клиента хранится только в памяти страницы: для повтора потерянного запроса после её перезагрузки нужно знать исходный ключ.
 - Ключи уникальны внутри заказа; отдельный индекс запрещает вторую pending/succeeded-попытку. У провайдера наш ID платежа служит отдельным ключом. Отказ сохраняется в истории и требует нового ключа для новой попытки.
 - Старые записи встроенного mock не мигрируют в выдуманные внешние операции. История сохраняется; для нового этапа создавай новые заказы.
-- Подтверждение webhook провайдера и доставка результата заказам — два разных факта. Есть ручная сверка, но нет worker, outbox, брокера или фоновой гарантированной доставки.
+- Сохранение платежа, publisher confirm и consumer ack — разные факты. `notificationStatus: published` означает приём брокером, не обработку заказа. Старое delivered сохранено только для исторических HTTP-записей. Consumer выполняет обработку асинхронно, повторяет временные ошибки и отправляет неисправимые сообщения в DLQ.
+- Outbox и inbox пока не добавлены. Если процесс упал после коммита платежа, но до публикации, RabbitMQ не узнает о событии. После восстановления брокера нужна ручная сверка. Следующий этап закрывает именно это окно, а не делает текущий код «exactly once».
 - Общей транзакции между тремя базами нет. Повтор исходного запроса помогает восстановиться, но не запускается автоматически. Удаление volume и ручное изменение таблиц не покрываются гарантиями.
 - Каталог в коде; API создаёт одну позицию на заказ. Частичные оплаты, возвраты и корзина пока не реализованы. Рублёвые суммы — целые копейки, без float.
 
-Полный план: [docs/plans/microservices-payments-learning.md](docs/plans/microservices-payments-learning.md). Следующий шаг — RabbitMQ и outbox; внешние webhooks при этом останутся HTTP.
+Полный план: [docs/plans/microservices-payments-learning.md](docs/plans/microservices-payments-learning.md). Следующий шаг — transactional outbox/inbox; внешние webhooks остаются HTTP.

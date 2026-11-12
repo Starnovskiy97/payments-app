@@ -1,26 +1,24 @@
-import {
-  Body,
-  Controller,
-  Get,
-  Headers,
-  Param,
-  ParseUUIDPipe,
-  Post,
-  UseGuards,
-} from '@nestjs/common';
-import { ApiHeader, ApiSecurity, ApiTags } from '@nestjs/swagger';
-import { CreateOrderDto, PaymentResultDto, PayOrderDto } from './dto';
-import { InternalGuard } from './internal.guard';
+import { Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post } from '@nestjs/common';
+import { ApiHeader, ApiTags } from '@nestjs/swagger';
+import { CreateOrderDto, PayOrderDto } from './dto';
+import { PaymentEventsConsumer } from './payment-events.consumer';
 import { OrdersService, PRODUCTS } from './orders.service';
 
 @ApiTags('orders')
 @Controller()
 export class OrdersController {
-  constructor(private readonly orders: OrdersService) {}
+  constructor(
+    private readonly orders: OrdersService,
+    private readonly events: PaymentEventsConsumer,
+  ) {}
 
   @Get('health')
   health() {
-    return { service: 'orders-service', status: 'ok' };
+    return {
+      service: 'orders-service',
+      status: 'ok',
+      rabbitmq: this.events.connected ? 'connected' : 'disconnected',
+    };
   }
 
   @Get('products')
@@ -55,12 +53,5 @@ export class OrdersController {
     @Headers('idempotency-key') key?: string,
   ) {
     return this.orders.pay(id, dto, key);
-  }
-
-  @Post('internal/payment-results')
-  @UseGuards(InternalGuard)
-  @ApiSecurity('internal')
-  result(@Body() dto: PaymentResultDto) {
-    return this.orders.handlePaymentResult(dto);
   }
 }

@@ -10,7 +10,7 @@ async function bootstrap() {
   if (process.env.NODE_ENV === 'production')
     throw new Error('Учебный симулятор нельзя запускать в production');
   const app = await NestFactory.create(AppModule, { rawBody: true });
-if (await app.get(DataSource).showMigrations()) {
+  if (await app.get(DataSource).showMigrations()) {
     await app.close();
     throw new Error(
       'Есть неприменённые миграции payments-service. Выполните npm run db:migrate из корня.',

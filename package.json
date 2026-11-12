@@ -3,16 +3,18 @@
   "private": true,
   "version": "0.1.0",
   "workspaces": [
+    "packages/*",
     "apps/*"
   ],
   "engines": {
     "node": ">=22.14.0"
   },
   "scripts": {
+    "predev": "npm run build -w @lab/messaging",
     "dev": "concurrently -k -n orders,payments,provider,client -c blue,magenta,yellow,green \"npm run dev -w @lab/orders-service\" \"npm run dev -w @lab/payments-service\" \"npm run dev -w @lab/payment-provider-simulator\" \"npm run dev -w @lab/client\"",
     "build": "npm run build --workspaces",
     "typecheck": "npm run typecheck --workspaces",
-    "test": "npm run build && npm run db:test:up && npm run test:integration",
+    "test": "npm run build && npm run db:test:up && npm run mq:test:up && npm run test:integration",
     "test:integration": "node --test tests/integration.test.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -21,7 +23,11 @@
     "db:migrate": "npm run migration:run -w @lab/orders-service -w @lab/payments-service -w @lab/payment-provider-simulator",
     "db:migrations": "npm run migration:show -w @lab/orders-service -w @lab/payments-service -w @lab/payment-provider-simulator",
     "db:test:up": "docker compose --profile test up -d --wait orders-test-db payments-test-db provider-test-db",
-    "db:test:down": "docker compose --profile test stop orders-test-db payments-test-db provider-test-db"
+    "db:test:down": "docker compose --profile test stop orders-test-db payments-test-db provider-test-db",
+    "mq:up": "docker compose up -d --wait rabbitmq",
+    "mq:down": "docker compose stop rabbitmq",
+    "mq:test:up": "docker compose --profile test up -d --wait rabbitmq-test",
+    "mq:test:down": "docker compose --profile test stop rabbitmq-test"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

@@ -25,7 +25,9 @@ export interface Payment {
   provider: string;
   providerPaymentId: string | null;
   checkoutUrl: string | null;
-  notificationStatus: 'not_sent' | 'delivered' | 'failed';
+  notificationStatus: 'not_sent' | 'published' | 'delivered' | 'failed';
+  resultEventId: string | null;
+  resultRecordedAt: string | null;
   notificationAttempts: number;
   createdAt: string;
 }

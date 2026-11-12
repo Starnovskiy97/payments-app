@@ -2,6 +2,7 @@ import type { DataSourceOptions } from 'typeorm';
 import { PaymentEntity } from './entities/payment.entity';
 import { CreatePayments1794355200001 } from './migrations/1794355200001-CreatePayments';
 import { AddProviderReference1794355200003 } from './migrations/1794355200003-AddProviderReference';
+import { AddResultEvent1794355200004 } from './migrations/1794355200004-AddResultEvent';
 
 export function databaseOptions(): DataSourceOptions {
   return {
@@ -9,7 +10,11 @@ export function databaseOptions(): DataSourceOptions {
     url:
       process.env.DATABASE_URL ?? 'postgresql://payments:payments_local@127.0.0.1:15434/payments',
     entities: [PaymentEntity],
-    migrations: [CreatePayments1794355200001, AddProviderReference1794355200003],
+    migrations: [
+      CreatePayments1794355200001,
+      AddProviderReference1794355200003,
+      AddResultEvent1794355200004,
+    ],
     synchronize: false,
     migrationsRun: false,
     migrationsTransactionMode: 'all',

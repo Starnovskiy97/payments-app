@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "predev": "npm run build -w @lab/messaging",
+    "prebuild": "npm run build -w @lab/messaging",
+    "pretypecheck": "npm run build -w @lab/messaging",
     "dev": "tsc-watch --noClear --onSuccess \"node dist/main.js\"",
     "build": "tsc",
     "start": "node dist/main.js",
@@ -11,6 +14,7 @@
     "migration:show": "npm run build && typeorm migration:show -d dist/database/data-source.js"
   },
   "dependencies": {
+    "@lab/messaging": "*",
     "@nestjs/common": "^11.1.0",
     "@nestjs/core": "^11.1.0",
     "@nestjs/platform-express": "^11.1.0",

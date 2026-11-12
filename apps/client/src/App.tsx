@@ -436,23 +436,27 @@ export default function App() {
                     <p
                       className={`text-xs ${payment.notificationStatus === 'failed' ? 'text-rose-700' : 'text-muted-foreground'}`}
                     >
-                      Уведомление orders-service:{' '}
+                      Публикация события в RabbitMQ:{' '}
                       <strong>
-                        {payment.notificationStatus === 'delivered'
-                          ? 'доставлено'
-                          : payment.notificationStatus === 'failed'
-                            ? 'ошибка доставки — повторите уведомление'
-                            : 'ещё не отправлено'}
+                        {payment.notificationStatus === 'published'
+                          ? 'брокер подтвердил приём'
+                          : payment.notificationStatus === 'delivered'
+                            ? 'старое HTTP-уведомление доставлено'
+                            : payment.notificationStatus === 'failed'
+                              ? 'публикация не подтверждена — выполните сверку'
+                              : 'ещё не отправлено'}
                       </strong>
-                      . Попыток: {payment.notificationAttempts}.
+                      . Попыток: {payment.notificationAttempts}. Это не подтверждение обработки
+                      заказа.
                     </p>
                   </div>
                 )}
                 <p className="text-xs leading-relaxed text-muted-foreground">
                   При сетевой ошибке повтор используется с тем же Idempotency-Key. После отказа
                   можно создать новую попытку. Заказы, платежи и ключи сохраняются в отдельных
-                  PostgreSQL и переживают перезапуск сервисов. Автоматической доставки уведомлений
-                  пока нет.
+                  PostgreSQL и переживают перезапуск сервисов. Доставку событий между платежами и
+                  заказами теперь выполняет RabbitMQ. При недоступном брокере пока требуется ручная
+                  сверка: outbox ещё не добавлен.
                 </p>
                 <Button variant="outline" size="sm" disabled={busy} onClick={delayNextCreate}>
                   Следующее создание: потерять ответ
@@ -522,7 +526,7 @@ export default function App() {
         </CardContent>
       </Card>
       <footer className="py-6 text-center text-xs text-muted-foreground">
-        NestJS + HTTP · Три PostgreSQL · Подписанные webhooks · Учебный провайдер
+        NestJS + RabbitMQ · Consumer ack после COMMIT · Outbox — следующий этап
       </footer>
     </main>
   );

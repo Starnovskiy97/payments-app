@@ -1,6 +1,41 @@
 name: payments-lab
 
 services:
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: lab
+      RABBITMQ_DEFAULT_PASS: lab_local
+    ports:
+      - '127.0.0.1:5672:5672'
+      - '127.0.0.1:15672:15672'
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  rabbitmq-test:
+    image: rabbitmq:4.1-management-alpine
+    hostname: rabbitmq-test
+    profiles: ['test']
+    environment:
+      RABBITMQ_DEFAULT_USER: lab_test
+      RABBITMQ_DEFAULT_PASS: lab_test_local
+    ports:
+      - '127.0.0.1:5673:5672'
+      - '127.0.0.1:15673:15672'
+    volumes:
+      - rabbitmq-test-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
   orders-db:
     image: postgres:17-alpine
     environment:
@@ -104,6 +139,8 @@ services:
       retries: 30
 
 volumes:
+  rabbitmq-data:
+  rabbitmq-test-data:
   orders-data:
   payments-data:
   provider-data:

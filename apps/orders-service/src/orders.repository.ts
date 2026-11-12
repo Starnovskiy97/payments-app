@@ -4,6 +4,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { OrderEntity } from './database/entities/order.entity';
 import { OrderItemEntity } from './database/entities/order-item.entity';
+import { PermanentMessageError, type PaymentResultEvent } from '@lab/messaging';
 
 // Публичный HTTP-контракт остаётся прежним, хотя в БД заказ и позиции разделены.
 export interface Order {
@@ -87,8 +88,22 @@ export class OrdersRepository {
       .execute();
   }
 
-  async markPaid(id: string): Promise<void> {
-    await this.orders.update({ id }, { status: 'paid' });
+  async applyPaymentResult(event: PaymentResultEvent): Promise<void> {
+    await this.orders.manager.transaction(async (manager) => {
+      const order = await manager.findOne(OrderEntity, {
+        where: { id: event.orderId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!order) throw new PermanentMessageError('Заказ из события не найден');
+      if (order.amount !== event.amount || order.currency !== event.currency) {
+        throw new PermanentMessageError('Сумма или валюта события не совпадает с заказом');
+      }
+      // Событие может прийти до HTTP-ответа /pay. Факт от доверенного брокера сам связывает ID.
+      if (!order.paymentIds.includes(event.paymentId)) order.paymentIds.push(event.paymentId);
+      if (event.type === 'payment.succeeded') order.status = 'paid';
+      // Повтор ещё не отсекается inbox, но обновление состояния идемпотентно.
+      await manager.save(OrderEntity, order);
+    });
   }
 
   private toOrder(entity: OrderEntity): Order {

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHmac, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { once } from 'node:events';
 import { createRequire } from 'node:module';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -15,6 +16,14 @@ const webhookSecret = randomUUID();
 const providerHeaders = { 'x-provider-token': providerToken };
 const token = randomUUID();
 const internal = { 'x-internal-token': token };
+const rabbitUrl =
+  process.env.TEST_RABBITMQ_URL ?? 'amqp://lab_test:lab_test_local@127.0.0.1:5673?heartbeat=5';
+const controlledBrokerContainer = process.env.TEST_RABBITMQ_CONTAINER;
+const skipBrokerFaults = !!process.env.TEST_RABBITMQ_URL && !controlledBrokerContainer;
+const queuePrefix = `test.${randomUUID().replaceAll('-', '')}`;
+process.env.RABBITMQ_URL = rabbitUrl;
+process.env.RABBITMQ_QUEUE_PREFIX = queuePrefix;
+const run = promisify(execFile);
 const children = [];
 let output = '';
 let ordersProcess;
@@ -53,6 +62,13 @@ const requireOrders = createRequire(
   new URL('../apps/orders-service/package.json', import.meta.url),
 );
 const { DataSource } = requireOrders('typeorm');
+const { RabbitConnection, queueNames, declareQueues } = requireOrders('@lab/messaging');
+const requireMessaging = createRequire(
+  new URL('../packages/messaging/package.json', import.meta.url),
+);
+const { connect } = requireMessaging('amqplib');
+const queues = queueNames(queuePrefix);
+const testBus = new RabbitConnection(() => undefined);
 const { databaseOptions } = requireOrders('./dist/database/database-options.js');
 const requirePayments = createRequire(
   new URL('../apps/payments-service/package.json', import.meta.url),
@@ -86,6 +102,8 @@ function start(service, port, overrides = {}) {
       ORDERS_SERVICE_URL: ordersUrl,
       PAYMENTS_SERVICE_URL: paymentsUrl,
       INTERNAL_API_TOKEN: token,
+      RABBITMQ_URL: rabbitUrl,
+      RABBITMQ_QUEUE_PREFIX: queuePrefix,
       PROVIDER_API_URL: providerUrl,
       PROVIDER_PUBLIC_URL: providerUrl,
       PROVIDER_API_TOKEN: providerToken,
@@ -112,9 +130,10 @@ function start(service, port, overrides = {}) {
 }
 
 async function ready(base) {
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 250; i++) {
     try {
-      if ((await api(base, '/health')).status === 200) return;
+      const response = await api(base, '/health');
+      if (response.status === 200 && response.data.rabbitmq !== 'disconnected') return;
     } catch {
       /* процесс ещё запускается */
     }
@@ -153,11 +172,12 @@ before(async () => {
     url: isolatedPaymentsDatabaseUrl.toString(),
   });
   await paymentsDatabase.initialize();
-  assert.equal((await paymentsDatabase.runMigrations()).length, 2);
+  assert.equal((await paymentsDatabase.runMigrations()).length, 3);
   assert.equal((await paymentsDatabase.runMigrations()).length, 0);
   await paymentsDatabase.undoLastMigration();
   await paymentsDatabase.undoLastMigration();
-  assert.equal((await paymentsDatabase.runMigrations()).length, 2);
+  await paymentsDatabase.undoLastMigration();
+  assert.equal((await paymentsDatabase.runMigrations()).length, 3);
 
   providerAdminDatabase = new DataSource({ type: 'postgres', url: testProviderDatabaseUrl });
   await providerAdminDatabase.initialize();
@@ -181,6 +201,17 @@ before(async () => {
 
 after(async () => {
   await Promise.all(children.map(stop));
+  await testBus.close();
+  try {
+    await withBroker(async (channel) => {
+      for (const queue of [queues.retry, queues.results, queues.dead])
+        await channel.deleteQueue(queue);
+    });
+  } catch {
+    console.warn(
+      `Брокер недоступен при очистке; очереди ${queuePrefix} могут остаться. Dev-очереди не затрагивались.`,
+    );
+  }
   if (database?.isInitialized) await database.destroy();
   if (adminDatabase?.isInitialized) {
     if (databaseCreated) await adminDatabase.query(`DROP DATABASE "${databaseName}"`);
@@ -202,14 +233,46 @@ after(async () => {
 
 // Результат задаётся только у внешнего симулятора. Затем читаем состояние нашего сервиса.
 async function completePayment(id, status, options = {}) {
+  const { waitForOrder = true, ...providerOptions } = options;
   const payment = await api(paymentsUrl, `/payments/${id}`);
   const result = await api(
     providerUrl,
     `/provider/payments/${payment.data.providerPaymentId}/complete`,
-    { status, ...options },
+    { status, ...providerOptions },
   );
   if (result.status !== 201) return result;
-  return { status: result.status, data: (await api(paymentsUrl, `/payments/${id}`)).data };
+  const data = (await api(paymentsUrl, `/payments/${id}`)).data;
+  if (waitForOrder && status === 'succeeded' && data.notificationStatus === 'published') {
+    await awaitOrder(data.orderId, 'paid');
+  }
+  return { status: result.status, data };
+}
+
+async function eventually(check, description, timeout = 12000) {
+  const until = Date.now() + timeout;
+  while (Date.now() < until) {
+    if (await check()) return;
+    await delay(50);
+  }
+  throw new Error(`Не дождались: ${description}\n${output}`);
+}
+
+async function awaitOrder(id, status) {
+  await eventually(
+    async () => (await api(ordersUrl, `/orders/${id}`)).data.status === status,
+    `заказ ${id}: ${status}`,
+  );
+}
+
+async function withBroker(action) {
+  const connection = await connect(rabbitUrl, { timeout: 2000 });
+  try {
+    const channel = await connection.createConfirmChannel();
+    await declareQueues(channel, queues);
+    return await action(channel);
+  } finally {
+    await connection.close();
+  }
 }
 
 async function createOrder() {
@@ -244,12 +307,14 @@ test('сквозной сценарий, параллельная идемпот
 
   const paid = await completePayment(payment.id, 'succeeded');
   assert.equal(paid.status, 201);
-  assert.equal(paid.data.notificationStatus, 'delivered');
+  assert.equal(paid.data.notificationStatus, 'published');
   assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'paid');
 
   const duplicate = await completePayment(payment.id, 'succeeded');
-  assert.equal(duplicate.data.notificationStatus, 'delivered');
+  assert.equal(duplicate.data.notificationStatus, 'published');
   assert.equal(duplicate.data.notificationAttempts, 2);
+  assert.equal(duplicate.data.resultEventId, paid.data.resultEventId);
+  assert.equal(duplicate.data.resultRecordedAt, paid.data.resultRecordedAt);
   assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds.length, 1);
   const repeated = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'sbp' }, headers);
   assert.equal(repeated.data.status, 'succeeded');
@@ -276,7 +341,7 @@ test('после отказа можно создать новую попытк�
     { 'Idempotency-Key': randomUUID() },
   );
   const failed = await completePayment(first.data.id, 'failed');
-  assert.equal(failed.data.notificationStatus, 'delivered');
+  assert.equal(failed.data.notificationStatus, 'published');
   assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
   const second = await api(
     ordersUrl,
@@ -307,7 +372,7 @@ test('валидация DTO, UUID, ключей и межсервисного �
   assert.equal((await api(ordersUrl, `/orders/${randomUUID()}`)).status, 404);
   assert.equal((await api(paymentsUrl, '/payments', {})).status, 401);
   assert.equal((await api(paymentsUrl, '/payments/lookup', {})).status, 401);
-  assert.equal((await api(ordersUrl, '/internal/payment-results', {})).status, 401);
+  assert.equal((await api(ordersUrl, '/internal/payment-results', {})).status, 404);
   const order = await createOrder();
   assert.equal((await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'card' })).status, 400);
   assert.equal(
@@ -338,7 +403,7 @@ test('payments-service проверяет идемпотентность нез�
   assert.equal((await api(paymentsUrl, '/payments', { ...dto, amount: 1 }, internal)).status, 409);
 });
 
-test('сбой доставки не отменяет платёж; повтор восстанавливает заказ', async () => {
+test('остановка заказов не мешает публикации; после запуска сообщение обрабатывается само', async () => {
   const order = await createOrder();
   const payment = await api(
     ordersUrl,
@@ -349,14 +414,13 @@ test('сбой доставки не отменяет платёж; повтор
   // SIGSTOP сохраняет процесс, но не даёт orders-service отвечать.
   ordersProcess.kill('SIGSTOP');
   try {
-    const result = await completePayment(payment.data.id, 'succeeded');
+    const result = await completePayment(payment.data.id, 'succeeded', { waitForOrder: false });
     assert.equal(result.data.status, 'succeeded');
-    assert.equal(result.data.notificationStatus, 'failed');
+    assert.equal(result.data.notificationStatus, 'published');
   } finally {
     ordersProcess.kill('SIGCONT');
   }
-  const retry = await completePayment(payment.data.id, 'succeeded');
-  assert.equal(retry.data.notificationStatus, 'delivered');
+  await awaitOrder(order.id, 'paid');
   assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'paid');
 });
 
@@ -372,7 +436,7 @@ test('заказы, позиции, статус и ID платежа сохра
     },
   );
   const notification = await completePayment(result.data.id, 'succeeded');
-  assert.equal(notification.data.notificationStatus, 'delivered');
+  assert.equal(notification.data.notificationStatus, 'published');
   const before = (await api(ordersUrl, `/orders/${paid.id}`)).data;
 
   await stop(ordersProcess);
@@ -385,7 +449,7 @@ test('заказы, позиции, статус и ID платежа сохра
 
   // Payments-service не перезапускался: повтор результата после рестарта заказов безопасен.
   const repeated = await completePayment(result.data.id, 'succeeded');
-  assert.equal(repeated.data.notificationStatus, 'delivered');
+  assert.equal(repeated.data.notificationStatus, 'published');
   assert.deepEqual((await api(ordersUrl, `/orders/${paid.id}`)).data, before);
 });
 
@@ -465,7 +529,7 @@ test('ключ, платёж и доставка переживают перез
   );
 
   const paid = await completePayment(initial.data.id, 'succeeded');
-  assert.equal(paid.data.notificationStatus, 'delivered');
+  assert.equal(paid.data.notificationStatus, 'published');
   await restartServices();
   const replay = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'sbp' }, headers);
   assert.equal(replay.status, 201);
@@ -548,29 +612,36 @@ test('две реплики сервисов не создают дубли ни
   }
 });
 
-test('неуспешная доставка сохраняется; исходный ключ восстанавливает заказ после рестарта', async () => {
-  const order = await createOrder();
-  const headers = { 'Idempotency-Key': randomUUID() };
-  const initial = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'card' }, headers);
-  await stop(ordersProcess);
-  const result = await completePayment(initial.data.id, 'succeeded');
-  assert.equal(result.data.status, 'succeeded');
-  assert.equal(result.data.notificationStatus, 'failed');
-  assert.equal(result.data.notificationAttempts, 1);
+test(
+  'очередь переживает остановку заказов и перезапуск брокера',
+  { skip: skipBrokerFaults },
+  async () => {
+    const order = await createOrder();
+    const headers = { 'Idempotency-Key': randomUUID() };
+    const initial = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'card' }, headers);
+    await stop(ordersProcess);
+    const result = await completePayment(initial.data.id, 'succeeded', { waitForOrder: false });
+    assert.equal(result.data.status, 'succeeded');
+    assert.equal(result.data.notificationStatus, 'published');
+    assert.equal(result.data.notificationAttempts, 1);
 
-  await restartServices();
-  assert.deepEqual((await api(paymentsUrl, `/payments/${initial.data.id}`)).data, result.data);
-  assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
-  const replay = await api(ordersUrl, `/orders/${order.id}/pay`, { method: 'card' }, headers);
-  assert.equal(replay.status, 201);
-  assert.equal(replay.data.id, initial.data.id);
-  assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'paid');
-
-  const delivered = await completePayment(initial.data.id, 'succeeded');
-  assert.equal(delivered.data.notificationStatus, 'delivered');
-  // Сверка при повторе оплаты уже выполнила вторую доставку; webhook — третью.
-  assert.equal(delivered.data.notificationAttempts, 3);
-});
+    assert.ok(
+      (await withBroker((channel) => channel.checkQueue(queues.results))).messageCount >= 1,
+    );
+    try {
+      await stopTestBroker();
+    } finally {
+      await startTestBroker();
+      ordersProcess = start('orders-service', 3101);
+      await ready(ordersUrl);
+    }
+    await awaitOrder(order.id, 'paid');
+    assert.equal(
+      (await api(paymentsUrl, `/payments/${initial.data.id}`)).data.notificationAttempts,
+      1,
+    );
+  },
+);
 
 test('повтор запроса восстанавливает потерянную связь с платежом без создания нового', async () => {
   const order = await createOrder();
@@ -591,7 +662,7 @@ test('повтор запроса восстанавливает потерян�
   assert.equal(initial.status, 201);
   assert.deepEqual((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds, []);
   const earlyResult = await completePayment(initial.data.id, 'succeeded');
-  assert.equal(earlyResult.data.notificationStatus, 'failed');
+  assert.equal(earlyResult.data.notificationStatus, 'published');
   await restartServices();
   const replay = await api(
     ordersUrl,
@@ -622,20 +693,22 @@ test('финальный статус защищён от гонки; повто
   assert.equal(outcomes.filter((result) => result.status === 201).length, 1);
   assert.equal(outcomes.filter((result) => result.status === 409).length, 1);
   const winner = outcomes.find((result) => result.status === 201).data;
-  assert.equal(winner.notificationStatus, 'delivered');
+  assert.equal(winner.notificationStatus, 'published');
   await Promise.all(
     Array.from({ length: 5 }, () => completePayment(initial.data.id, winner.status)),
   );
   const saved = (await api(paymentsUrl, `/payments/${initial.data.id}`)).data;
   assert.equal(saved.status, winner.status);
   assert.equal(saved.notificationAttempts, 6);
-  assert.equal(saved.notificationStatus, 'delivered');
+  assert.equal(saved.notificationStatus, 'published');
 
   // Ошибка позднего повтора не отменяет уже доказанную доставку.
   await stop(ordersProcess);
   try {
-    const failedRetry = await completePayment(initial.data.id, winner.status);
-    assert.equal(failedRetry.data.notificationStatus, 'delivered');
+    const failedRetry = await completePayment(initial.data.id, winner.status, {
+      waitForOrder: false,
+    });
+    assert.equal(failedRetry.data.notificationStatus, 'published');
     assert.equal(failedRetry.data.notificationAttempts, 7);
   } finally {
     ordersProcess = start('orders-service', 3101);
@@ -802,6 +875,7 @@ test('webhook проверяет подпись, время, исходные б
     signal: AbortSignal.timeout(10000),
   });
   assert.equal(response.status, 200);
+  await awaitOrder(order.id, 'paid');
   assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'paid');
   assert.equal(
     (await api(paymentsUrl, '/webhooks/simulator', body, webhookHeaders(JSON.stringify(body))))
@@ -893,3 +967,174 @@ test('задержанные и повторные webhooks не создают 
   assert.equal(remote.data.webhookAttempts, 3);
   assert.equal(remote.data.webhookStatus, 'delivered');
 });
+
+function resultEvent(order, overrides = {}) {
+  return {
+    eventId: randomUUID(),
+    type: 'payment.succeeded',
+    version: 1,
+    paymentId: randomUUID(),
+    orderId: order.id,
+    amount: order.amount,
+    currency: order.currency,
+    occurredAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+async function publishEvent(event) {
+  await testBus.publish(queues.results, Buffer.from(JSON.stringify(event)), {
+    messageId: event.eventId,
+  });
+}
+
+test('дубликаты события безопасны, а consumer не требует работающего payments-service', async () => {
+  const order = await createOrder();
+  const event = resultEvent(order);
+  await stop(paymentsProcess);
+  try {
+    await publishEvent(event);
+    await awaitOrder(order.id, 'paid');
+    await publishEvent(event);
+    await eventually(
+      async () =>
+        (await withBroker((channel) => channel.checkQueue(queues.results))).messageCount === 0,
+      'очередь опустела',
+    );
+    const saved = (await api(ordersUrl, `/orders/${order.id}`)).data;
+    assert.deepEqual(saved.paymentIds, [event.paymentId]);
+    assert.equal(saved.status, 'paid');
+  } finally {
+    paymentsProcess = start('payments-service', 3102);
+    await ready(paymentsUrl);
+  }
+});
+
+test('невалидный JSON, версия и неверная сумма уходят в DLQ, не меняя заказ', async () => {
+  const order = await createOrder();
+  const invalidVersion = resultEvent(order, { version: 99 });
+  const invalidAmount = resultEvent(order, { amount: 1 });
+  const brokenId = randomUUID();
+  await testBus.publish(queues.results, Buffer.from('not-json'), { messageId: brokenId });
+  await publishEvent(invalidVersion);
+  await publishEvent(invalidAmount);
+  const expected = new Set([brokenId, invalidVersion.eventId, invalidAmount.eventId]);
+  const seen = new Set();
+  await eventually(async () => {
+    await withBroker(async (channel) => {
+      let message;
+      while ((message = await channel.get(queues.dead, { noAck: false }))) {
+        if (expected.has(message.properties.messageId)) {
+          assert.ok(message.properties.headers['x-lab-error']);
+          seen.add(message.properties.messageId);
+        }
+        channel.ack(message);
+      }
+    });
+    return seen.size === expected.size;
+  }, 'некорректные сообщения в DLQ');
+  assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
+});
+
+test('временная ошибка SQL уходит в отложенный повтор и восстанавливается после исправления', async () => {
+  const order = await createOrder();
+  const event = resultEvent(order);
+  // Изменяется только одноразовая тестовая БД, не dev-таблицы и не контейнер с tmpfs.
+  await database.query('ALTER TABLE orders RENAME TO orders_temporarily_unavailable');
+  try {
+    await publishEvent(event);
+    await eventually(
+      async () =>
+        (await withBroker((channel) => channel.checkQueue(queues.retry))).messageCount > 0,
+      'сообщение в retry',
+    );
+  } finally {
+    await database.query('ALTER TABLE orders_temporarily_unavailable RENAME TO orders');
+  }
+  await awaitOrder(order.id, 'paid');
+  assert.deepEqual((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds, [
+    event.paymentId,
+  ]);
+});
+
+test('после лимита временных ошибок сообщение помещается в DLQ', async () => {
+  const order = await createOrder();
+  const event = resultEvent(order);
+  await database.query('ALTER TABLE orders RENAME TO orders_temporarily_unavailable');
+  try {
+    await testBus.publish(queues.results, Buffer.from(JSON.stringify(event)), {
+      messageId: event.eventId,
+      headers: { 'x-lab-retry-count': 5 },
+    });
+    await eventually(
+      async () =>
+        withBroker(async (channel) => {
+          const message = await channel.get(queues.dead, { noAck: false });
+          if (!message) return false;
+          channel.ack(message);
+          return message.properties.messageId === event.eventId;
+        }),
+      'исчерпавшее повторы сообщение в DLQ',
+    );
+  } finally {
+    await database.query('ALTER TABLE orders_temporarily_unavailable RENAME TO orders');
+  }
+  assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
+});
+
+test('mandatory отклоняет публикацию без очереди, даже если брокер прислал confirm', async () => {
+  await assert.rejects(testBus.publish(`${queuePrefix}.missing`, Buffer.from('{}')), /mandatory/);
+});
+
+test(
+  'без outbox падение брокера требует ручной сверки; успешный платёж не теряется',
+  { skip: skipBrokerFaults },
+  async () => {
+    const order = await createOrder();
+    const payment = (
+      await api(
+        ordersUrl,
+        `/orders/${order.id}/pay`,
+        { method: 'card' },
+        { 'Idempotency-Key': randomUUID() },
+      )
+    ).data;
+    try {
+      await stopTestBroker();
+      const result = await completePayment(payment.id, 'succeeded', { waitForOrder: false });
+      assert.equal(result.data.status, 'succeeded');
+      assert.equal(result.data.notificationStatus, 'failed');
+      assert.ok(result.data.resultEventId);
+      assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
+    } finally {
+      await startTestBroker();
+      await Promise.all([ready(ordersUrl), ready(paymentsUrl)]);
+    }
+    await delay(300);
+    assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
+    const recovered = await api(paymentsUrl, `/payments/${payment.id}/sync`, {});
+    assert.equal(recovered.data.notificationStatus, 'published');
+    await awaitOrder(order.id, 'paid');
+  },
+);
+
+async function stopTestBroker() {
+  if (controlledBrokerContainer) await run('docker', ['stop', controlledBrokerContainer]);
+  else await run('docker', ['compose', '--profile', 'test', 'stop', 'rabbitmq-test']);
+}
+
+async function startTestBroker() {
+  if (controlledBrokerContainer) await run('docker', ['start', controlledBrokerContainer]);
+  else await run('docker', ['compose', '--profile', 'test', 'up', '-d', '--wait', 'rabbitmq-test']);
+  await eventually(
+    async () => {
+      try {
+        return await withBroker(async () => true);
+      } catch {
+        return false;
+      }
+    },
+    'RabbitMQ после перезапуска',
+    30000,
+  );
+}

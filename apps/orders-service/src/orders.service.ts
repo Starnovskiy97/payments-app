@@ -6,7 +6,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import axios from 'axios';
-import { CreateOrderDto, PaymentResultDto, PayOrderDto } from './dto';
+import { CreateOrderDto, PayOrderDto } from './dto';
 import { OrdersRepository, type Order } from './orders.repository';
 
 export const PRODUCTS = [
@@ -21,7 +21,7 @@ interface Payment {
   currency: 'RUB';
   method: PayOrderDto['method'];
   status: 'pending' | 'succeeded' | 'failed';
-  notificationStatus: 'not_sent' | 'delivered' | 'failed';
+  notificationStatus: 'not_sent' | 'published' | 'delivered' | 'failed';
   createdAt: string;
 }
 
@@ -95,36 +95,5 @@ export class OrdersService {
         'Payments-service недоступен или отклонил запрос. Повторите с тем же Idempotency-Key',
       );
     }
-  }
-
-  private async fetchPayment(id: string) {
-    try {
-      return (await this.payments.get<Payment>(`/payments/${id}`)).data;
-    } catch {
-      throw new BadGatewayException('Не удалось получить платёж из payments-service');
-    }
-  }
-
-  async handlePaymentResult(dto: PaymentResultDto) {
-    const order = await this.get(dto.orderId);
-    if (!order.paymentIds.includes(dto.paymentId))
-      throw new ConflictException('Платёж не принадлежит заказу');
-    // Не доверяем одному лишь телу уведомления: сверяем состояние в payments-service.
-    const payment = await this.fetchPayment(dto.paymentId);
-    if (
-      payment.orderId !== order.id ||
-      payment.amount !== order.amount ||
-      payment.currency !== order.currency ||
-      payment.status !== dto.status
-    ) {
-      throw new ConflictException('Данные платежа не совпадают с заказом или уведомлением');
-    }
-    if (payment.status === 'succeeded') await this.orders.markPaid(order.id);
-    const updated = await this.get(order.id);
-    // Повторное уведомление безопасно. Неуспешная попытка не отменяет уже оплаченную покупку.
-    this.logger.log(
-      `Результат ${dto.status}: платёж ${dto.paymentId}, заказ ${order.id} (${updated.status})`,
-    );
-    return updated;
   }
 }

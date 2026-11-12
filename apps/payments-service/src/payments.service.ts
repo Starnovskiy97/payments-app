@@ -1,5 +1,5 @@
 import { ConflictException, Inject, Injectable, Logger } from '@nestjs/common';
-import axios from 'axios';
+import { PaymentEventsPublisher } from './payment-events.publisher';
 import { CreatePaymentDto, ProviderWebhookDto } from './dto';
 import {
   PAYMENT_PROVIDER,
@@ -11,19 +11,19 @@ import { PaymentsRepository, type Payment } from './payments.repository';
 @Injectable()
 export class PaymentsService {
   private readonly logger = new Logger(PaymentsService.name);
-  private readonly orders = axios.create({
-    baseURL: process.env.ORDERS_SERVICE_URL ?? 'http://127.0.0.1:3001',
-    timeout: 3000,
-    headers: { 'x-internal-token': process.env.INTERNAL_API_TOKEN ?? 'local-learning-only' },
-  });
 
   constructor(
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
     private readonly payments: PaymentsRepository,
+    private readonly events: PaymentEventsPublisher,
   ) {}
 
   get(id: string) {
     return this.payments.get(id);
+  }
+
+  get messagingConnected(): boolean {
+    return this.events.connected;
   }
 
   lookup(dto: CreatePaymentDto) {
@@ -92,26 +92,20 @@ export class PaymentsService {
 
   private async applyResult(id: string, status: ProviderWebhookDto['status']) {
     const payment = await this.payments.recordResult(id, status);
-    await this.notifyOrder(payment);
+    await this.publishResult(payment);
   }
 
-  private async notifyOrder(payment: Payment) {
-    let delivered = false;
+  private async publishResult(payment: Payment) {
+    let published = false;
     try {
-      await this.orders.post('/internal/payment-results', {
-        paymentId: payment.id,
-        orderId: payment.orderId,
-        status: payment.status,
-      });
-      delivered = true;
-      this.logger.log(`Результат платежа ${payment.id} доставлен в orders-service`);
+      await this.events.publish(payment);
+      published = true;
     } catch {
       // Оплата и доставка уведомления — разные факты. Ошибка доставки не отменяет оплату.
       this.logger.warn(
-        `Результат платежа ${payment.id} не доставлен. Повторите учебное уведомление`,
+        `Результат ${payment.id} сохранён, но публикация не подтверждена. Пока нет outbox: выполните сверку после восстановления брокера`,
       );
     }
-    // Ошибка записи доставки не должна выглядеть как ошибка HTTP-вызова.
-    await this.payments.recordDelivery(payment.id, delivered);
+    await this.payments.recordPublication(payment.id, published);
   }
 }

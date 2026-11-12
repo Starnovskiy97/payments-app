@@ -16,7 +16,9 @@ export interface Payment {
   providerPaymentId: string | null;
   checkoutUrl: string | null;
   status: 'pending' | 'succeeded' | 'failed';
-  notificationStatus: 'not_sent' | 'delivered' | 'failed';
+  notificationStatus: 'not_sent' | 'published' | 'delivered' | 'failed';
+  resultEventId: string | null;
+  resultRecordedAt: string | null;
   notificationAttempts: number;
   createdAt: string;
 }
@@ -100,22 +102,24 @@ export class PaymentsRepository {
       if (payment.status !== 'pending' && payment.status !== status) {
         throw new ConflictException('Финальный статус платежа нельзя изменить');
       }
-      // Статус и счётчик фиксируются до HTTP-вызова. Сетевое ожидание не держит блокировку.
+      // Это стабильная идентичность события, но НЕ outbox: фоновой публикации ещё нет.
       payment.status = status;
+      payment.resultEventId ??= randomUUID();
+      payment.resultRecordedAt ??= new Date();
       payment.notificationAttempts += 1;
       await manager.save(PaymentEntity, payment);
       return this.toPayment(payment);
     });
   }
 
-  async recordDelivery(id: string, delivered: boolean): Promise<void> {
+  async recordPublication(id: string, published: boolean): Promise<void> {
     const query = this.payments
       .createQueryBuilder()
       .update(PaymentEntity)
-      .set({ notificationStatus: delivered ? 'delivered' : 'failed' })
+      .set({ notificationStatus: published ? 'published' : 'failed' })
       .where('id = :id', { id });
-    // Доказанный успех доставки не отменяется ошибкой параллельного повтора.
-    if (!delivered) query.andWhere("notification_status <> 'delivered'");
+    // Подтверждение брокера не означает обработку заказа.
+    if (!published) query.andWhere("notification_status <> 'published'");
     await query.execute();
   }
 
@@ -131,6 +135,8 @@ export class PaymentsRepository {
       checkoutUrl: entity.checkoutUrl,
       status: entity.status,
       notificationStatus: entity.notificationStatus,
+      resultEventId: entity.resultEventId,
+      resultRecordedAt: entity.resultRecordedAt?.toISOString() ?? null,
       notificationAttempts: entity.notificationAttempts,
       createdAt: entity.createdAt.toISOString(),
     };

@@ -21,7 +21,12 @@ export class PaymentsController {
 
   @Get('health')
   health() {
-    return { service: 'payments-service', status: 'ok', provider: 'simulator' };
+    return {
+      service: 'payments-service',
+      status: 'ok',
+      provider: 'simulator',
+      rabbitmq: this.payments.messagingConnected ? 'connected' : 'disconnected',
+    };
   }
 
   @Post('payments')
