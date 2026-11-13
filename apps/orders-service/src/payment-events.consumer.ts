@@ -49,10 +49,12 @@ export class PaymentEventsConsumer implements OnModuleInit, OnModuleDestroy {
     let failure: unknown;
     try {
       const event = parsePaymentResult(message.content);
-      await this.orders.applyPaymentResult(event);
+      const applied = await this.orders.applyPaymentResult(event);
       // Только после COMMIT. Если ack потеряется, повтор безопасен по состоянию.
       channel.ack(message);
-      this.logger.log(`Обработано ${event.eventId}; заказ ${event.orderId}`);
+      this.logger.log(
+        `${applied ? 'Применено' : 'Дубликат пропущен'} ${event.eventId}; заказ ${event.orderId}`,
+      );
       return;
     } catch (error) {
       failure = error;

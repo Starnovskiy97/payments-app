@@ -23,6 +23,7 @@ const skipBrokerFaults = !!process.env.TEST_RABBITMQ_URL && !controlledBrokerCon
 const queuePrefix = `test.${randomUUID().replaceAll('-', '')}`;
 process.env.RABBITMQ_URL = rabbitUrl;
 process.env.RABBITMQ_QUEUE_PREFIX = queuePrefix;
+process.env.OUTBOX_LEASE_MS = '2000';
 const run = promisify(execFile);
 const children = [];
 let output = '';
@@ -104,6 +105,10 @@ function start(service, port, overrides = {}) {
       INTERNAL_API_TOKEN: token,
       RABBITMQ_URL: rabbitUrl,
       RABBITMQ_QUEUE_PREFIX: queuePrefix,
+      OUTBOX_WORKER_ENABLED: 'true',
+      OUTBOX_POLL_MS: '50',
+      OUTBOX_LEASE_MS: '2000',
+      OUTBOX_RETRY_BASE_MS: '100',
       PROVIDER_API_URL: providerUrl,
       PROVIDER_PUBLIC_URL: providerUrl,
       PROVIDER_API_TOKEN: providerToken,
@@ -157,11 +162,12 @@ before(async () => {
   databaseCreated = true;
   database = new DataSource({ ...databaseOptions(), url: isolatedDatabaseUrl.toString() });
   await database.initialize();
-  assert.equal((await database.runMigrations()).length, 1);
+  assert.equal((await database.runMigrations()).length, 2);
   assert.equal((await database.runMigrations()).length, 0);
   // Откат проверяется только на пустой одноразовой тестовой базе.
   await database.undoLastMigration();
-  assert.equal((await database.runMigrations()).length, 1);
+  await database.undoLastMigration();
+  assert.equal((await database.runMigrations()).length, 2);
 
   paymentsAdminDatabase = new DataSource({ type: 'postgres', url: testPaymentsDatabaseUrl });
   await paymentsAdminDatabase.initialize();
@@ -172,12 +178,38 @@ before(async () => {
     url: isolatedPaymentsDatabaseUrl.toString(),
   });
   await paymentsDatabase.initialize();
-  assert.equal((await paymentsDatabase.runMigrations()).length, 3);
+  assert.equal((await paymentsDatabase.runMigrations()).length, 4);
   assert.equal((await paymentsDatabase.runMigrations()).length, 0);
+  // Проверяем не только пустую схему, но и перенос старых финальных платежей в outbox.
+  await paymentsDatabase.undoLastMigration();
+  const legacy = ['published', 'failed', 'delivered'].map((notificationStatus) => ({
+    id: randomUUID(),
+    notificationStatus,
+  }));
+  for (const row of legacy) {
+    await paymentsDatabase.query(
+      `INSERT INTO payments
+      (id, order_id, idempotency_key, amount, currency, method, provider, status, notification_status, notification_attempts)
+      VALUES ($1, $2, $3, 50000, 'RUB', 'card', 'simulator', 'succeeded', $4, 2)`,
+      [row.id, randomUUID(), randomUUID(), row.notificationStatus],
+    );
+  }
+  assert.equal((await paymentsDatabase.runMigrations()).length, 1);
+  for (const row of legacy) {
+    const [saved] = await paymentsDatabase.query(
+      'SELECT * FROM payment_outbox WHERE payment_id = $1',
+      [row.id],
+    );
+    assert.equal(saved.status, row.notificationStatus === 'failed' ? 'pending' : 'published');
+    assert.equal(saved.payload.paymentId, row.id);
+    assert.equal(saved.payload.eventId, saved.event_id);
+    assert.equal(saved.attempts, 2);
+  }
   await paymentsDatabase.undoLastMigration();
   await paymentsDatabase.undoLastMigration();
   await paymentsDatabase.undoLastMigration();
-  assert.equal((await paymentsDatabase.runMigrations()).length, 3);
+  await paymentsDatabase.undoLastMigration();
+  assert.equal((await paymentsDatabase.runMigrations()).length, 4);
 
   providerAdminDatabase = new DataSource({ type: 'postgres', url: testProviderDatabaseUrl });
   await providerAdminDatabase.initialize();
@@ -233,7 +265,7 @@ after(async () => {
 
 // Результат задаётся только у внешнего симулятора. Затем читаем состояние нашего сервиса.
 async function completePayment(id, status, options = {}) {
-  const { waitForOrder = true, ...providerOptions } = options;
+  const { waitForOrder = true, waitForPublication = true, ...providerOptions } = options;
   const payment = await api(paymentsUrl, `/payments/${id}`);
   const result = await api(
     providerUrl,
@@ -241,6 +273,15 @@ async function completePayment(id, status, options = {}) {
     { status, ...providerOptions },
   );
   if (result.status !== 201) return result;
+  if (waitForPublication) {
+    await eventually(
+      async () =>
+        ['published', 'failed'].includes(
+          (await api(paymentsUrl, `/payments/${id}`)).data.notificationStatus,
+        ),
+      'worker попытался опубликовать событие',
+    );
+  }
   const data = (await api(paymentsUrl, `/payments/${id}`)).data;
   if (waitForOrder && status === 'succeeded' && data.notificationStatus === 'published') {
     await awaitOrder(data.orderId, 'paid');
@@ -312,7 +353,7 @@ test('сквозной сценарий, параллельная идемпот
 
   const duplicate = await completePayment(payment.id, 'succeeded');
   assert.equal(duplicate.data.notificationStatus, 'published');
-  assert.equal(duplicate.data.notificationAttempts, 2);
+  assert.equal(duplicate.data.notificationAttempts, 1);
   assert.equal(duplicate.data.resultEventId, paid.data.resultEventId);
   assert.equal(duplicate.data.resultRecordedAt, paid.data.resultRecordedAt);
   assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds.length, 1);
@@ -699,7 +740,7 @@ test('финальный статус защищён от гонки; повто
   );
   const saved = (await api(paymentsUrl, `/payments/${initial.data.id}`)).data;
   assert.equal(saved.status, winner.status);
-  assert.equal(saved.notificationAttempts, 6);
+  assert.equal(saved.notificationAttempts, 1);
   assert.equal(saved.notificationStatus, 'published');
 
   // Ошибка позднего повтора не отменяет уже доказанную доставку.
@@ -709,7 +750,7 @@ test('финальный статус защищён от гонки; повто
       waitForOrder: false,
     });
     assert.equal(failedRetry.data.notificationStatus, 'published');
-    assert.equal(failedRetry.data.notificationAttempts, 7);
+    assert.equal(failedRetry.data.notificationAttempts, 1);
   } finally {
     ordersProcess = start('orders-service', 3101);
     await ready(ordersUrl);
@@ -882,7 +923,7 @@ test('webhook проверяет подпись, время, исходные б
       .status,
     200,
   );
-  assert.equal((await api(paymentsUrl, `/payments/${payment.id}`)).data.notificationAttempts, 2);
+  assert.equal((await api(paymentsUrl, `/payments/${payment.id}`)).data.notificationAttempts, 1);
 });
 
 test('потерянный webhook восстанавливается сверкой с провайдером', async () => {
@@ -906,6 +947,7 @@ test('потерянный webhook восстанавливается сверк
   const synced = await api(paymentsUrl, `/payments/${payment.id}/sync`, {});
   assert.equal(synced.status, 200);
   assert.equal(synced.data.status, 'succeeded');
+  await awaitOrder(order.id, 'paid');
   assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'paid');
 });
 
@@ -955,7 +997,7 @@ test('задержанные и повторные webhooks не создают 
     )
   ).data;
   const result = await completePayment(payment.id, 'succeeded', { delayMs: 200, copies: 3 });
-  assert.equal(result.data.notificationAttempts, 3);
+  assert.equal(result.data.notificationAttempts, 1);
   assert.equal(result.data.status, 'succeeded');
   assert.deepEqual((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds, [payment.id]);
   const remote = await api(
@@ -1034,6 +1076,15 @@ test('невалидный JSON, версия и неверная сумма у�
     return seen.size === expected.size;
   }, 'некорректные сообщения в DLQ');
   assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
+  assert.equal(
+    (
+      await database.query(
+        'SELECT count(*)::integer AS count FROM payment_inbox WHERE event_id = $1',
+        [invalidAmount.eventId],
+      )
+    )[0].count,
+    0,
+  );
 });
 
 test('временная ошибка SQL уходит в отложенный повтор и восстанавливается после исправления', async () => {
@@ -1087,7 +1138,7 @@ test('mandatory отклоняет публикацию без очереди, �
 });
 
 test(
-  'без outbox падение брокера требует ручной сверки; успешный платёж не теряется',
+  'outbox автоматически доставляет результат после восстановления брокера',
   { skip: skipBrokerFaults },
   async () => {
     const order = await createOrder();
@@ -1110,11 +1161,13 @@ test(
       await startTestBroker();
       await Promise.all([ready(ordersUrl), ready(paymentsUrl)]);
     }
-    await delay(300);
-    assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
-    const recovered = await api(paymentsUrl, `/payments/${payment.id}/sync`, {});
-    assert.equal(recovered.data.notificationStatus, 'published');
+    // Никакого sync или повторного webhook: worker сам читает сохранённое задание.
     await awaitOrder(order.id, 'paid');
+    await eventually(
+      async () =>
+        (await api(paymentsUrl, `/payments/${payment.id}`)).data.notificationStatus === 'published',
+      'outbox отмечен опубликованным',
+    );
   },
 );
 
@@ -1138,3 +1191,430 @@ async function startTestBroker() {
     30000,
   );
 }
+
+function outboxRepository() {
+  const { OutboxRepository } = requirePayments('./dist/outbox/outbox.repository.js');
+  const { PaymentOutboxEntity } = requirePayments(
+    './dist/database/entities/payment-outbox.entity.js',
+  );
+  return new OutboxRepository(paymentsDatabase.getRepository(PaymentOutboxEntity));
+}
+
+function ordersRepository() {
+  const { OrdersRepository } = requireOrders('./dist/orders.repository.js');
+  const { OrderEntity } = requireOrders('./dist/database/entities/order.entity.js');
+  return new OrdersRepository(database.getRepository(OrderEntity));
+}
+
+async function restartPayments(overrides = {}) {
+  await stop(paymentsProcess);
+  paymentsProcess = start('payments-service', 3102, overrides);
+  await ready(paymentsUrl);
+}
+
+async function crash(child) {
+  const exited = once(child, 'exit');
+  child.kill('SIGKILL');
+  await exited;
+}
+
+test('ошибка записи outbox откатывает финальный статус платежа', async () => {
+  const order = await createOrder();
+  const payment = (
+    await api(
+      ordersUrl,
+      `/orders/${order.id}/pay`,
+      { method: 'card' },
+      { 'Idempotency-Key': randomUUID() },
+    )
+  ).data;
+  const { PaymentsRepository } = requirePayments('./dist/payments.repository.js');
+  const { PaymentEntity } = requirePayments('./dist/database/entities/payment.entity.js');
+  const repository = new PaymentsRepository(paymentsDatabase.getRepository(PaymentEntity));
+  await paymentsDatabase.query('ALTER TABLE payment_outbox RENAME TO payment_outbox_unavailable');
+  try {
+    await assert.rejects(repository.recordResult(payment.id, 'succeeded'), /payment_outbox/);
+    const saved = (await api(paymentsUrl, `/payments/${payment.id}`)).data;
+    assert.equal(saved.status, 'pending');
+    assert.equal(saved.resultEventId, null);
+    assert.equal(saved.resultRecordedAt, null);
+  } finally {
+    await paymentsDatabase.query('ALTER TABLE payment_outbox_unavailable RENAME TO payment_outbox');
+  }
+  assert.equal(
+    (
+      await paymentsDatabase.query(
+        'SELECT count(*)::integer AS count FROM payment_outbox WHERE payment_id = $1',
+        [payment.id],
+      )
+    )[0].count,
+    0,
+  );
+  await completePayment(payment.id, 'succeeded');
+});
+
+test('после SIGKILL между коммитом и публикацией worker сам отправляет сохранённое задание', async () => {
+  let order;
+  let payment;
+  await restartPayments({ OUTBOX_WORKER_ENABLED: 'false' });
+  try {
+    order = await createOrder();
+    const initial = (
+      await api(
+        ordersUrl,
+        `/orders/${order.id}/pay`,
+        { method: 'sbp' },
+        { 'Idempotency-Key': randomUUID() },
+      )
+    ).data;
+    payment = (
+      await completePayment(initial.id, 'succeeded', {
+        waitForPublication: false,
+        waitForOrder: false,
+      })
+    ).data;
+    assert.equal(payment.notificationStatus, 'not_sent');
+    assert.equal(payment.notificationAttempts, 0);
+    const [job] = await paymentsDatabase.query(
+      'SELECT * FROM payment_outbox WHERE payment_id = $1',
+      [payment.id],
+    );
+    assert.equal(job.status, 'pending');
+    assert.equal(job.payload.eventId, payment.resultEventId);
+    assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
+    await crash(paymentsProcess);
+  } finally {
+    await restartPayments();
+  }
+  await awaitOrder(order.id, 'paid');
+  await eventually(
+    async () =>
+      (await api(paymentsUrl, `/payments/${payment.id}`)).data.notificationStatus === 'published',
+    'worker отправил outbox после рестарта',
+  );
+  const [saved] = await paymentsDatabase.query(
+    'SELECT event_id, status FROM payment_outbox WHERE payment_id = $1',
+    [payment.id],
+  );
+  assert.equal(saved.event_id, payment.resultEventId);
+  assert.equal(saved.status, 'published');
+});
+
+test('публикация без отметки повторяется после lease; inbox не применяет событие дважды', async () => {
+  let order;
+  let eventId;
+  let before;
+  await restartPayments({ OUTBOX_WORKER_ENABLED: 'false' });
+  try {
+    order = await createOrder();
+    const payment = (
+      await api(
+        ordersUrl,
+        `/orders/${order.id}/pay`,
+        { method: 'card' },
+        { 'Idempotency-Key': randomUUID() },
+      )
+    ).data;
+    await completePayment(payment.id, 'succeeded', {
+      waitForPublication: false,
+      waitForOrder: false,
+    });
+    const job = await outboxRepository().claim();
+    assert.equal(job.paymentId, payment.id);
+    eventId = job.eventId;
+    await publishEvent(job.payload);
+    await awaitOrder(order.id, 'paid');
+    before = (
+      await database.query('SELECT xmin::text AS revision FROM orders WHERE id = $1', [order.id])
+    )[0].revision;
+    // Broker confirm уже был, но отметку published специально не сохраняем.
+    await crash(paymentsProcess);
+  } finally {
+    await restartPayments();
+  }
+  await eventually(
+    async () =>
+      (
+        await paymentsDatabase.query('SELECT status FROM payment_outbox WHERE event_id = $1', [
+          eventId,
+        ])
+      )[0].status === 'published',
+    'lease восстановлен, outbox завершён',
+  );
+  await eventually(
+    async () => output.includes(`Дубликат пропущен ${eventId}`),
+    'inbox пропустил повтор от worker',
+  );
+  assert.equal(
+    (await database.query('SELECT xmin::text AS revision FROM orders WHERE id = $1', [order.id]))[0]
+      .revision,
+    before,
+  );
+  assert.equal(
+    (
+      await database.query(
+        'SELECT count(*)::integer AS count FROM payment_inbox WHERE event_id = $1',
+        [eventId],
+      )
+    )[0].count,
+    1,
+  );
+});
+
+test('старый claim token не может завершить или освободить задание нового worker', async () => {
+  await restartPayments({ OUTBOX_WORKER_ENABLED: 'false' });
+  try {
+    const order = await createOrder();
+    const payment = (
+      await api(
+        ordersUrl,
+        `/orders/${order.id}/pay`,
+        { method: 'card' },
+        { 'Idempotency-Key': randomUUID() },
+      )
+    ).data;
+    await completePayment(payment.id, 'succeeded', {
+      waitForPublication: false,
+      waitForOrder: false,
+    });
+    const repository = outboxRepository();
+    const first = await repository.claim();
+    assert.equal(first.paymentId, payment.id);
+    await paymentsDatabase.query(
+      "UPDATE payment_outbox SET locked_until = now() - interval '1 second' WHERE event_id = $1",
+      [first.eventId],
+    );
+    const second = await repository.claim();
+    assert.equal(second.eventId, first.eventId);
+    assert.notEqual(second.lockedBy, first.lockedBy);
+    assert.equal(await repository.markPublished(first), false);
+    assert.equal(await repository.releaseFailed(first, 'поздний ответ старого worker'), false);
+    const [current] = await paymentsDatabase.query(
+      'SELECT status, locked_by FROM payment_outbox WHERE event_id = $1',
+      [first.eventId],
+    );
+    assert.equal(current.status, 'processing');
+    assert.equal(current.locked_by, second.lockedBy);
+    await publishEvent(second.payload);
+    assert.equal(await repository.markPublished(second), true);
+    assert.equal(await repository.releaseFailed(second, 'поздняя ошибка после confirm'), false);
+    await awaitOrder(order.id, 'paid');
+  } finally {
+    await restartPayments();
+  }
+});
+
+test('две реплики worker публикуют по одному заданию, повторные webhooks не создают новые', async () => {
+  const replica = start('payments-service', 3106);
+  try {
+    await ready('http://127.0.0.1:3106');
+    const payments = await Promise.all(
+      Array.from({ length: 6 }, async () => {
+        const order = await createOrder();
+        return (
+          await api(
+            ordersUrl,
+            `/orders/${order.id}/pay`,
+            { method: 'card' },
+            { 'Idempotency-Key': randomUUID() },
+          )
+        ).data;
+      }),
+    );
+    await Promise.all(
+      payments.map((payment) => completePayment(payment.id, 'succeeded', { copies: 3 })),
+    );
+    const rows = await paymentsDatabase.query(
+      'SELECT payment_id, attempts, status FROM payment_outbox WHERE payment_id = ANY($1::uuid[])',
+      [payments.map((payment) => payment.id)],
+    );
+    assert.equal(rows.length, payments.length);
+    for (const row of rows) {
+      assert.equal(row.status, 'published');
+      assert.equal(row.attempts, 1);
+    }
+  } finally {
+    await stop(replica);
+  }
+});
+
+test('ошибка изменения заказа откатывает inbox, и исправленный повтор не пропускается', async () => {
+  const order = await createOrder();
+  const event = resultEvent(order);
+  const repository = ordersRepository();
+  await database.query(
+    "ALTER TABLE orders ADD CONSTRAINT test_block_paid CHECK (status <> 'paid') NOT VALID",
+  );
+  try {
+    await assert.rejects(repository.applyPaymentResult(event), /test_block_paid/);
+    assert.equal(
+      (
+        await database.query(
+          'SELECT count(*)::integer AS count FROM payment_inbox WHERE event_id = $1',
+          [event.eventId],
+        )
+      )[0].count,
+      0,
+    );
+    assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'pending');
+  } finally {
+    await database.query('ALTER TABLE orders DROP CONSTRAINT test_block_paid');
+  }
+  assert.equal(await repository.applyPaymentResult(event), true);
+  assert.equal(await repository.applyPaymentResult(event), false);
+  assert.equal((await api(ordersUrl, `/orders/${order.id}`)).data.status, 'paid');
+});
+
+test('конкурентные одинаковые eventId применяются один раз; другой payload не считается дубликатом', async () => {
+  const order = await createOrder();
+  const event = resultEvent(order);
+  const repository = ordersRepository();
+  const results = await Promise.all(
+    Array.from({ length: 8 }, () => repository.applyPaymentResult(event)),
+  );
+  assert.equal(results.filter(Boolean).length, 1);
+  const before = (
+    await database.query('SELECT xmin::text AS revision FROM orders WHERE id = $1', [order.id])
+  )[0].revision;
+  const reordered = {
+    occurredAt: event.occurredAt,
+    currency: event.currency,
+    amount: event.amount,
+    orderId: event.orderId.toUpperCase(),
+    paymentId: event.paymentId.toUpperCase(),
+    version: event.version,
+    type: event.type,
+    eventId: event.eventId.toUpperCase(),
+  };
+  assert.equal(await repository.applyPaymentResult(reordered), false);
+  assert.equal(
+    (await database.query('SELECT xmin::text AS revision FROM orders WHERE id = $1', [order.id]))[0]
+      .revision,
+    before,
+  );
+  await assert.rejects(
+    repository.applyPaymentResult({ ...event, amount: event.amount + 1 }),
+    /другим содержимым/,
+  );
+  assert.deepEqual((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds, [
+    event.paymentId,
+  ]);
+});
+
+test('падение consumer после COMMIT без ack приводит к повтору, который отсекается inbox', async () => {
+  const order = await createOrder();
+  const event = resultEvent(order);
+  await stop(ordersProcess);
+  let revision;
+  try {
+    await publishEvent(event);
+    await withBroker(async (channel) => {
+      const message = await channel.get(queues.results, { noAck: false });
+      assert.ok(message);
+      assert.equal(message.properties.messageId, event.eventId);
+      assert.equal(
+        await ordersRepository().applyPaymentResult(JSON.parse(message.content.toString())),
+        true,
+      );
+      revision = (
+        await database.query('SELECT xmin::text AS revision FROM orders WHERE id = $1', [order.id])
+      )[0].revision;
+      // withBroker закроет соединение без ack — брокер вернёт сообщение в очередь.
+    });
+  } finally {
+    ordersProcess = start('orders-service', 3101);
+    await ready(ordersUrl);
+  }
+  await eventually(
+    async () => output.includes(`Дубликат пропущен ${event.eventId}`),
+    'повтор после потерянного ack',
+  );
+  assert.equal(
+    (await database.query('SELECT xmin::text AS revision FROM orders WHERE id = $1', [order.id]))[0]
+      .revision,
+    revision,
+  );
+});
+
+test('SKIP LOCKED позволяет worker забрать другое задание, не ожидая занятую строку', async () => {
+  await restartPayments({ OUTBOX_WORKER_ENABLED: 'false' });
+  const runner = paymentsDatabase.createQueryRunner();
+  let firstOrder;
+  try {
+    firstOrder = await createOrder();
+    const secondOrder = await createOrder();
+    const payments = [];
+    for (const order of [firstOrder, secondOrder]) {
+      const payment = (
+        await api(
+          ordersUrl,
+          `/orders/${order.id}/pay`,
+          { method: 'card' },
+          { 'Idempotency-Key': randomUUID() },
+        )
+      ).data;
+      await completePayment(payment.id, 'succeeded', {
+        waitForPublication: false,
+        waitForOrder: false,
+      });
+      payments.push(payment);
+    }
+    await runner.connect();
+    await runner.startTransaction();
+    await runner.query('SELECT event_id FROM payment_outbox WHERE payment_id = $1 FOR UPDATE', [
+      payments[0].id,
+    ]);
+    let timer;
+    const repository = outboxRepository();
+    const job = await Promise.race([
+      repository.claim(),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('claim ожидает занятую строку вместо SKIP LOCKED')),
+          1500,
+        );
+      }),
+    ]).finally(() => clearTimeout(timer));
+    assert.equal(job.paymentId, payments[1].id);
+    await publishEvent(job.payload);
+    assert.equal(await repository.markPublished(job), true);
+    await awaitOrder(secondOrder.id, 'paid');
+  } finally {
+    if (runner.isTransactionActive) await runner.rollbackTransaction();
+    await runner.release();
+    await restartPayments();
+  }
+  await awaitOrder(firstOrder.id, 'paid');
+});
+
+test('коллизия eventId с изменённым payload идёт в DLQ, исходный inbox остаётся неизменным', async () => {
+  const order = await createOrder();
+  const event = resultEvent(order);
+  await publishEvent(event);
+  await awaitOrder(order.id, 'paid');
+  const [before] = await database.query(
+    'SELECT payload_hash, processed_at FROM payment_inbox WHERE event_id = $1',
+    [event.eventId],
+  );
+  await publishEvent({ ...event, paymentId: randomUUID() });
+  await eventually(
+    async () =>
+      withBroker(async (channel) => {
+        const message = await channel.get(queues.dead, { noAck: false });
+        if (!message) return false;
+        channel.ack(message);
+        if (message.properties.messageId !== event.eventId) return false;
+        assert.match(message.properties.headers['x-lab-error'], /другим содержимым/);
+        return true;
+      }),
+    'коллизия eventId в DLQ',
+  );
+  const [after] = await database.query(
+    'SELECT payload_hash, processed_at FROM payment_inbox WHERE event_id = $1',
+    [event.eventId],
+  );
+  assert.deepEqual(after, before);
+  assert.deepEqual((await api(ordersUrl, `/orders/${order.id}`)).data.paymentIds, [
+    event.paymentId,
+  ]);
+});

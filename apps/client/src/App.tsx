@@ -443,8 +443,10 @@ export default function App() {
                           : payment.notificationStatus === 'delivered'
                             ? 'старое HTTP-уведомление доставлено'
                             : payment.notificationStatus === 'failed'
-                              ? 'публикация не подтверждена — выполните сверку'
-                              : 'ещё не отправлено'}
+                              ? 'публикация не подтверждена — worker повторит автоматически'
+                              : payment.status === 'pending'
+                                ? 'результат ещё не получен'
+                                : 'событие в outbox, ожидает worker'}
                       </strong>
                       . Попыток: {payment.notificationAttempts}. Это не подтверждение обработки
                       заказа.
@@ -455,8 +457,9 @@ export default function App() {
                   При сетевой ошибке повтор используется с тем же Idempotency-Key. После отказа
                   можно создать новую попытку. Заказы, платежи и ключи сохраняются в отдельных
                   PostgreSQL и переживают перезапуск сервисов. Доставку событий между платежами и
-                  заказами теперь выполняет RabbitMQ. При недоступном брокере пока требуется ручная
-                  сверка: outbox ещё не добавлен.
+                  заказами выполняют outbox-worker и RabbitMQ. Повторы обработки отсекаются inbox.
+                  При восстановлении брокера доставка продолжится автоматически; потерянный внешний
+                  webhook по-прежнему требует сверки с провайдером.
                 </p>
                 <Button variant="outline" size="sm" disabled={busy} onClick={delayNextCreate}>
                   Следующее создание: потерять ответ
@@ -526,7 +529,7 @@ export default function App() {
         </CardContent>
       </Card>
       <footer className="py-6 text-center text-xs text-muted-foreground">
-        NestJS + RabbitMQ · Consumer ack после COMMIT · Outbox — следующий этап
+        NestJS + RabbitMQ · Transactional outbox/inbox · Consumer ack после COMMIT
       </footer>
     </main>
   );

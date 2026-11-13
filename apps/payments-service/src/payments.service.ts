@@ -1,4 +1,4 @@
-import { ConflictException, Inject, Injectable, Logger } from '@nestjs/common';
+import { ConflictException, Inject, Injectable } from '@nestjs/common';
 import { PaymentEventsPublisher } from './payment-events.publisher';
 import { CreatePaymentDto, ProviderWebhookDto } from './dto';
 import {
@@ -10,8 +10,6 @@ import { PaymentsRepository, type Payment } from './payments.repository';
 
 @Injectable()
 export class PaymentsService {
-  private readonly logger = new Logger(PaymentsService.name);
-
   constructor(
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
     private readonly payments: PaymentsRepository,
@@ -91,21 +89,8 @@ export class PaymentsService {
   }
 
   private async applyResult(id: string, status: ProviderWebhookDto['status']) {
-    const payment = await this.payments.recordResult(id, status);
-    await this.publishResult(payment);
-  }
-
-  private async publishResult(payment: Payment) {
-    let published = false;
-    try {
-      await this.events.publish(payment);
-      published = true;
-    } catch {
-      // Оплата и доставка уведомления — разные факты. Ошибка доставки не отменяет оплату.
-      this.logger.warn(
-        `Результат ${payment.id} сохранён, но публикация не подтверждена. Пока нет outbox: выполните сверку после восстановления брокера`,
-      );
-    }
-    await this.payments.recordPublication(payment.id, published);
+    // Webhook подтверждается после SQL COMMIT, независимо от доступности RabbitMQ.
+    // Сохранённое задание отправит worker, даже если HTTP-процесс затем перезапустится.
+    await this.payments.recordResult(id, status);
   }
 }

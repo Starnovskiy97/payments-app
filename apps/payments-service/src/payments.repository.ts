@@ -4,6 +4,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { PaymentEntity } from './database/entities/payment.entity';
 import { CreatePaymentDto, ProviderWebhookDto } from './dto';
+import { PaymentOutboxEntity } from './database/entities/payment-outbox.entity';
+import type { PaymentResultEvent } from '@lab/messaging';
 
 // В публичный ответ намеренно не включаем внутренний ключ идемпотентности.
 export interface Payment {
@@ -102,25 +104,35 @@ export class PaymentsRepository {
       if (payment.status !== 'pending' && payment.status !== status) {
         throw new ConflictException('Финальный статус платежа нельзя изменить');
       }
-      // Это стабильная идентичность события, но НЕ outbox: фоновой публикации ещё нет.
+      // Изменение платежа и задание на публикацию коммитятся либо вместе, либо никак.
       payment.status = status;
       payment.resultEventId ??= randomUUID();
       payment.resultRecordedAt ??= new Date();
-      payment.notificationAttempts += 1;
       await manager.save(PaymentEntity, payment);
+      const existing = await manager.findOneBy(PaymentOutboxEntity, {
+        eventId: payment.resultEventId,
+      });
+      if (!existing) {
+        const event: PaymentResultEvent = {
+          eventId: payment.resultEventId,
+          version: 1,
+          type: status === 'succeeded' ? 'payment.succeeded' : 'payment.failed',
+          paymentId: payment.id,
+          orderId: payment.orderId,
+          amount: payment.amount,
+          currency: payment.currency,
+          occurredAt: payment.resultRecordedAt.toISOString(),
+        };
+        // Payment row lock сериализует повторы. Готовое задание не сбрасываем в pending.
+        await manager.insert(PaymentOutboxEntity, {
+          eventId: event.eventId,
+          paymentId: payment.id,
+          payload: event,
+          status: 'pending',
+        });
+      }
       return this.toPayment(payment);
     });
-  }
-
-  async recordPublication(id: string, published: boolean): Promise<void> {
-    const query = this.payments
-      .createQueryBuilder()
-      .update(PaymentEntity)
-      .set({ notificationStatus: published ? 'published' : 'failed' })
-      .where('id = :id', { id });
-    // Подтверждение брокера не означает обработку заказа.
-    if (!published) query.andWhere("notification_status <> 'published'");
-    await query.execute();
   }
 
   private toPayment(entity: PaymentEntity): Payment {

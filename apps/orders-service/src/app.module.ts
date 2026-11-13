@@ -7,11 +7,12 @@ import { OrdersController } from './orders.controller';
 import { OrdersService } from './orders.service';
 import { OrdersRepository } from './orders.repository';
 import { PaymentEventsConsumer } from './payment-events.consumer';
+import { PaymentInboxEntity } from './database/entities/payment-inbox.entity';
 
 @Module({
   imports: [
     TypeOrmModule.forRoot({ ...databaseOptions(), retryAttempts: 2, retryDelay: 1000 }),
-    TypeOrmModule.forFeature([OrderEntity, OrderItemEntity]),
+    TypeOrmModule.forFeature([OrderEntity, OrderItemEntity, PaymentInboxEntity]),
   ],
   controllers: [OrdersController],
   providers: [OrdersService, OrdersRepository, PaymentEventsConsumer],
